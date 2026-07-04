@@ -1,130 +1,181 @@
-// src/pages/ReportPage.jsx
-import { useState } from 'react'
+// src/pages/ReportPage.jsx — 带筛选和SGD/RM货币
+import { useState, useMemo } from 'react'
 import { C, S } from '../App'
 
+const PLATFORMS = ['全部','Shopee SG','Shopee MY','Lazada MY','Lazada SG']
+const PERIODS   = [{id:'7',label:'7天'},{id:'30',label:'30天'},{id:'90',label:'90天'},{id:'365',label:'全年'}]
+
+const currency = p => (p||'').toLowerCase().includes('my') ? 'RM' : 'SGD'
+const daysUntil = d => d ? Math.ceil((new Date(d)-new Date())/864e5) : null
+
+function Pill({active,onClick,children,color=C.orange}){
+  return <button onClick={onClick} style={{padding:'5px 12px',borderRadius:20,border:`1.5px solid ${active?color:C.slateLight+'50'}`,background:active?color:'#fff',color:active?'#fff':C.slate,fontSize:11,fontWeight:active?700:400,cursor:'pointer',whiteSpace:'nowrap'}}>{children}</button>
+}
+
 export default function ReportPage({ products, batches, purchaseOrders, totalStock }) {
-  const [period, setPeriod] = useState('30')
+  const [period,     setPeriod]     = useState('30')
+  const [platFilter, setPlatFilter] = useState('全部')
+  const [sortBy,     setSortBy]     = useState('value') // value | stock | expiry_risk
 
-  // Cost of goods in stock
-  const inventoryValue = products.reduce((s, p) => s + totalStock(p.id) * (p.cost || 0), 0)
-
-  // Purchase history totals
-  const allItems = purchaseOrders.flatMap(po => (po.po_items || []).map(i => ({ ...i, date: po.order_date })))
+  const today  = new Date()
   const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - parseInt(period))
-  const recentItems = allItems.filter(i => new Date(i.date) >= cutoff)
-  const totalPurchased = recentItems.reduce((s, i) => s + i.qty * (i.cost || 0), 0)
-  const totalUnits = recentItems.reduce((s, i) => s + i.qty, 0)
+
+  // Filter products by platform
+  const filteredProducts = useMemo(() =>
+    platFilter === '全部' ? products
+      : products.filter(p => (p.platform||'').includes(platFilter.replace('全部','')))
+  , [products, platFilter])
+
+  // Inventory value by currency
+  const sgdProducts = filteredProducts.filter(p => currency(p.platform)==='SGD')
+  const myrProducts = filteredProducts.filter(p => currency(p.platform)==='RM')
+  const sgdValue = sgdProducts.reduce((s,p)=>s+totalStock(p.id)*(p.cost||0),0)
+  const myrValue = myrProducts.reduce((s,p)=>s+totalStock(p.id)*(p.cost||0),0)
 
   // Expiry risk value
-  const today = new Date()
-  const expiryRisk = batches
-    .filter(b => b.expiry_date && Math.ceil((new Date(b.expiry_date) - today) / 864e5) <= 30 && b.qty > 0)
-    .reduce((s, b) => {
-      const p = products.find(x => x.id === b.product_id)
-      return s + b.qty * (p?.cost || 0)
-    }, 0)
+  const expiryRisk = filteredProducts.reduce((s,p)=>{
+    const risk = batches.filter(b=>b.product_id===p.id&&b.expiry_date&&b.qty>0)
+      .filter(b=>daysUntil(b.expiry_date)<=30)
+      .reduce((s,b)=>s+b.qty*(p.cost||0),0)
+    return s+risk
+  },0)
 
-  // Per-product breakdown
-  const productStats = products.map(p => {
-    const stock = totalStock(p.id)
-    const value = stock * (p.cost || 0)
-    const pBatches = batches.filter(b => b.product_id === p.id)
-    const nearExpiry = pBatches.filter(b => b.expiry_date && Math.ceil((new Date(b.expiry_date) - today) / 864e5) <= 30)
-    return { ...p, stock, value, nearExpiry }
-  }).sort((a, b) => b.value - a.value)
+  // Product stats with sort
+  const productStats = useMemo(()=>{
+    const stats = filteredProducts.map(p=>{
+      const stock = totalStock(p.id)
+      const value = stock*(p.cost||0)
+      const cur   = currency(p.platform)
+      const risk  = batches.filter(b=>b.product_id===p.id&&b.expiry_date&&b.qty>0)
+        .filter(b=>daysUntil(b.expiry_date)<=30)
+        .reduce((s,b)=>s+b.qty*(p.cost||0),0)
+      return {...p, stock, value, cur, expiryRisk:risk}
+    }).filter(p=>p.stock>0)
+
+    if (sortBy==='value')       return [...stats].sort((a,b)=>b.value-a.value)
+    if (sortBy==='stock')       return [...stats].sort((a,b)=>b.stock-a.stock)
+    if (sortBy==='expiry_risk') return [...stats].sort((a,b)=>b.expiryRisk-a.expiryRisk)
+    return stats
+  },[filteredProducts,batches,sortBy])
+
+  // Recent POs
+  const recentPOs = purchaseOrders.filter(po=>new Date(po.order_date)>=cutoff)
+  const poTotal   = recentPOs.reduce((s,po)=>{
+    return s+(po.po_items||[]).reduce((s2,i)=>s2+i.qty*(i.cost||0),0)
+  },0)
+
+  const maxVal = Math.max(...productStats.map(p=>p.value),1)
 
   return (
     <div>
-      {/* Period selector */}
-      <div style={{ display:'flex', borderRadius:8, overflow:'hidden', border:`1.5px solid ${C.slateLight}40`, marginBottom:14 }}>
-        {[['7','7天'],['30','30天'],['90','90天'],['365','全年']].map(([v, l]) => (
-          <button key={v} onClick={() => setPeriod(v)} style={S.seg(period === v)}>{l}</button>
-        ))}
+      {/* Period + Platform filter */}
+      <div style={{...S.card,padding:'12px 14px'}}>
+        <div style={{marginBottom:10}}>
+          <div style={{fontSize:11,fontWeight:700,color:C.slate,marginBottom:6}}>时间段</div>
+          <div style={{display:'flex',gap:6}}>
+            {PERIODS.map(p=><Pill key={p.id} active={period===p.id} onClick={()=>setPeriod(p.id)}>{p.label}</Pill>)}
+          </div>
+        </div>
+        <div style={{marginBottom:10}}>
+          <div style={{fontSize:11,fontWeight:700,color:C.slate,marginBottom:6}}>平台筛选</div>
+          <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
+            {PLATFORMS.map(p=><Pill key={p} active={platFilter===p} onClick={()=>setPlatFilter(p)} color={C.blue}>{p}</Pill>)}
+          </div>
+        </div>
+        <div>
+          <div style={{fontSize:11,fontWeight:700,color:C.slate,marginBottom:6}}>排序</div>
+          <div style={{display:'flex',gap:5}}>
+            {[['value','库存价值'],['stock','库存数量'],['expiry_risk','效期风险']].map(([id,l])=>(
+              <Pill key={id} active={sortBy===id} onClick={()=>setSortBy(id)} color={C.purple}>{l}</Pill>
+            ))}
+          </div>
+        </div>
       </div>
 
-      {/* Summary stats */}
-      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:14 }}>
+      {/* Summary cards — split by currency */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:14}}>
         {[
-          [`RM ${inventoryValue.toFixed(0)}`, '库存总价值', C.blue],
-          [`RM ${totalPurchased.toFixed(0)}`, `${period}天入货`, C.navy],
-          [`${totalUnits}件`, `${period}天入库`, C.navy],
-          [`RM ${expiryRisk.toFixed(0)}`, '效期风险值', expiryRisk > 0 ? C.red : C.navyMid],
-        ].map(([v, l, col]) => (
-          <div key={l} style={{ background:C.navy, borderRadius:12, padding:'14px 16px' }}>
-            <div style={{ fontSize:22, fontWeight:900, color:col, lineHeight:1 }}>{v}</div>
-            <div style={{ fontSize:11, color:C.slateLight, marginTop:4 }}>{l}</div>
+          [`SGD ${sgdValue.toFixed(0)}`, 'SG 库存价值',   C.blue],
+          [`RM ${myrValue.toFixed(0)}`,  'MY 库存价值',   C.navy],
+          [filteredProducts.filter(p=>totalStock(p.id)>0).length, '有库存产品', C.navyMid],
+          [`RM/SGD ${expiryRisk.toFixed(0)}`, '效期风险值', expiryRisk>0?C.red:C.navyMid],
+        ].map(([v,l,bg])=>(
+          <div key={l} style={{background:bg,borderRadius:12,padding:'14px 16px'}}>
+            <div style={{fontSize:20,fontWeight:900,color:C.orange,lineHeight:1}}>{v}</div>
+            <div style={{fontSize:11,color:C.slateLight,marginTop:4}}>{l}</div>
           </div>
         ))}
       </div>
 
-      {/* Inventory breakdown */}
-      <div style={S.card}>
-        <div style={S.secTitle}>库存价值明细</div>
-        {productStats.filter(p => p.stock > 0).map((p, i, arr) => {
-          const pct = inventoryValue > 0 ? (p.value / inventoryValue) * 100 : 0
-          return (
-            <div key={p.id} style={{ paddingBottom:12, marginBottom:12, borderBottom: i < arr.length - 1 ? `1px solid ${C.cream}` : 'none' }}>
-              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:4 }}>
-                <div style={{ display:'flex', gap:8, alignItems:'center' }}>
-                  {p.photo_url && <img src={p.photo_url} style={{ width:28, height:28, borderRadius:5, objectFit:'cover' }} alt="" />}
-                  <div>
-                    <div style={{ fontSize:12, fontWeight:600 }}>{p.name} <span style={{ color:C.orange }}>{p.variant_name}</span></div>
-                    <div style={{ fontSize:10, color:C.slate }}>{p.stock}件 × RM{p.cost}</div>
-                  </div>
-                </div>
-                <div style={{ textAlign:'right' }}>
-                  <div style={{ fontSize:13, fontWeight:800 }}>RM {p.value.toFixed(2)}</div>
-                  <div style={{ fontSize:10, color:C.slate }}>{pct.toFixed(1)}%</div>
-                </div>
-              </div>
-              <div style={{ height:6, background:C.cream, borderRadius:3, overflow:'hidden' }}>
-                <div style={{ height:'100%', width:`${pct}%`, background: p.nearExpiry.length > 0 ? C.yellow : C.blue, borderRadius:3 }} />
-              </div>
-              {p.nearExpiry.length > 0 && (
-                <div style={{ fontSize:10, color:C.yellow, marginTop:3 }}>
-                  ⚠ {p.nearExpiry.reduce((s, b) => s + b.qty, 0)}件将于30天内到期
-                </div>
-              )}
-            </div>
-          )
-        })}
-        <div style={{ borderTop:`2px solid ${C.cream}`, paddingTop:10, display:'flex', justifyContent:'space-between' }}>
-          <span style={{ fontWeight:700 }}>总库存价值</span>
-          <span style={{ fontWeight:900, fontSize:16, color:C.navy }}>RM {inventoryValue.toFixed(2)}</span>
-        </div>
-      </div>
-
-      {/* Recent purchases */}
-      {recentItems.length > 0 && (
-        <div style={S.card}>
-          <div style={S.secTitle}>最近 {period} 天入货记录</div>
-          {purchaseOrders
-            .filter(po => new Date(po.order_date) >= cutoff)
-            .slice(0, 5)
-            .map((po, i, arr) => {
-              const poItems = po.po_items || []
-              const total = poItems.reduce((s, i) => s + i.qty * (i.cost || 0), 0)
-              return (
-                <div key={po.id} style={{ display:'flex', justifyContent:'space-between', paddingBottom:8, marginBottom:8, borderBottom: i < arr.length - 1 ? `1px solid ${C.cream}` : 'none' }}>
-                  <div>
-                    <div style={{ fontSize:13, fontWeight:600 }}>{po.po_number}</div>
-                    <div style={{ fontSize:11, color:C.slate }}>{po.order_date} · {poItems.length} 种产品</div>
-                  </div>
-                  <div style={{ fontSize:13, fontWeight:700 }}>RM {total.toFixed(2)}</div>
-                </div>
-              )
-            })}
+      {/* Purchase summary */}
+      {recentPOs.length>0&&(
+        <div style={{...S.card,background:C.navy,marginBottom:14}}>
+          <div style={{color:C.slateLight,fontSize:11,marginBottom:4}}>过去 {period} 天入货</div>
+          <div style={{color:C.orange,fontSize:24,fontWeight:900}}>RM/SGD {poTotal.toFixed(2)}</div>
+          <div style={{color:C.slateLight,fontSize:11,marginTop:4}}>{recentPOs.length} 张入货单</div>
         </div>
       )}
 
-      {/* Note about future Shopee import */}
-      <div style={{ ...S.card, background:C.navyLight }}>
-        <div style={{ color:C.orange, fontWeight:700, fontSize:12, marginBottom:6 }}>💡 盈利计算（即将推出）</div>
-        <div style={{ color:C.slateLight, fontSize:11, lineHeight:1.7 }}>
-          导入 Shopee / Lazada 订单 Excel 后，系统将自动计算：{'\n'}
-          • 每单毛利润 = 售价 − 成本 − 运费{'\n'}
-          • 净利润 = 毛利润 − 平台佣金（Shopee 6% / Lazada 5%）{'\n'}
-          • 月度盈利趋势图
+      {/* Product breakdown */}
+      <div style={S.card}>
+        <div style={{...S.secTitle,marginBottom:10}}>
+          库存明细 · {platFilter} · 排序：{sortBy==='value'?'价值':sortBy==='stock'?'数量':'效期风险'}
+        </div>
+
+        {productStats.slice(0,20).map((p,i)=>{
+          const pct = (p.value/maxVal)*100
+          const barColor = p.expiryRisk>0 ? C.yellow : p.cur==='SGD' ? C.blue : C.green
+          return (
+            <div key={p.id} style={{paddingBottom:12,marginBottom:12,
+                borderBottom:i<productStats.length-1?`1px solid ${C.cream}`:'none'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:4}}>
+                <div style={{display:'flex',gap:8,alignItems:'center',flex:1,minWidth:0}}>
+                  {p.photo_url&&<img src={p.photo_url} onError={e=>e.target.style.display='none'}
+                    style={{width:28,height:28,borderRadius:5,objectFit:'cover',flexShrink:0}} alt=""/>}
+                  <div style={{minWidth:0}}>
+                    <div style={{fontSize:12,fontWeight:600,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                      {p.name} {p.variant_name||''}
+                    </div>
+                    <div style={{fontSize:10,color:C.slate}}>
+                      {p.stock}件 × {p.cur} {(p.cost||0).toFixed(2)}
+                      <span style={{marginLeft:6,color:p.cur==='SGD'?C.blue:C.green,fontWeight:600}}>{p.cur}</span>
+                    </div>
+                  </div>
+                </div>
+                <div style={{textAlign:'right',flexShrink:0,marginLeft:8}}>
+                  <div style={{fontSize:13,fontWeight:800}}>{p.cur} {p.value.toFixed(2)}</div>
+                  {p.expiryRisk>0&&(
+                    <div style={{fontSize:10,color:C.yellow}}>⚠ {p.cur} {p.expiryRisk.toFixed(0)} 风险</div>
+                  )}
+                </div>
+              </div>
+              <div style={{height:5,background:C.cream,borderRadius:3,overflow:'hidden'}}>
+                <div style={{height:'100%',width:`${pct}%`,background:barColor,borderRadius:3}}/>
+              </div>
+            </div>
+          )
+        })}
+
+        {productStats.length>20&&(
+          <div style={{textAlign:'center',fontSize:12,color:C.slate,padding:'8px'}}>
+            还有 {productStats.length-20} 个产品未显示 · 使用上方筛选缩小范围
+          </div>
+        )}
+
+        {/* Totals */}
+        <div style={{borderTop:`2px solid ${C.cream}`,paddingTop:12,marginTop:4}}>
+          {sgdValue>0&&(
+            <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+              <span style={{fontSize:12,color:C.slate}}>Shopee SG 库存总值</span>
+              <span style={{fontWeight:800,color:C.blue}}>SGD {sgdValue.toFixed(2)}</span>
+            </div>
+          )}
+          {myrValue>0&&(
+            <div style={{display:'flex',justifyContent:'space-between'}}>
+              <span style={{fontSize:12,color:C.slate}}>Shopee/Lazada MY 库存总值</span>
+              <span style={{fontWeight:800,color:C.green}}>RM {myrValue.toFixed(2)}</span>
+            </div>
+          )}
         </div>
       </div>
     </div>
