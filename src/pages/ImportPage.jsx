@@ -1,14 +1,11 @@
 // src/pages/ImportPage.jsx
-// Reusable Excel import tool for Shopee & Lazada
-// Generates SQL that matches the same logic used in manual imports
-// Supports: Shopee MY/SG (inventory/sales/media/basic)
-//           Lazada MY/SG (pricestock/basic/skuimg)
+// Fixed version - no external xlsx library, uses built-in FileReader + manual TSV parsing
+// Shopee exports are TSV-based Excel files that can be read as text
 
-import { useState, useRef } from 'react'
+import { useState } from 'react'
 import { C, S } from '../App'
-import * as XLSX from 'xlsx'
 
-// ── Same categories as manual import ─────────────────────────
+// ── Categories ────────────────────────────────────────────────
 const CATEGORIES = {
   '维他命/保健品': ['vitamin','dhc','supplement','lutein','omega','collagen','probiotic',
                    'calcium','iron','coenzyme','spirulina','glucosamine','biotin','melatonin',
@@ -45,39 +42,85 @@ function safeSku(s) {
   return (s || '').replace(/[^a-zA-Z0-9\-_]/g, '').slice(0, 50)
 }
 
-function genUUID() {
-  return crypto.randomUUID()
+// ── Read file as text (handles both xlsx-as-text and csv) ──────
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = e => resolve(e.target.result)
+    reader.onerror = reject
+    // Try reading as text first - Shopee xlsx files are often readable as text/TSV
+    reader.readAsText(file, 'UTF-8')
+  })
 }
 
-// ── Parse Excel file into rows ────────────────────────────────
-function parseExcel(buffer, headerRowIndex = 4) {
-  const wb = XLSX.read(buffer, { type: 'array' })
-  const ws = wb.Sheets[wb.SheetNames[0]]
-  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' })
-  if (raw.length <= headerRowIndex) return []
-  const headers = raw[headerRowIndex].map(h => String(h).trim())
-  const rows = []
-  for (let i = headerRowIndex + 3; i < raw.length; i++) {
-    const row = raw[i]
-    if (!row[0] || !String(row[0]).trim()) continue
-    const obj = {}
-    headers.forEach((h, j) => { obj[h] = String(row[j] || '').trim() })
-    rows.push(obj)
+// ── Parse Shopee-style TSV/Excel text ─────────────────────────
+function parseShopeeText(text) {
+  const lines = text.split('\n').map(l => l.replace(/\r$/, ''))
+  
+  // Find header row (line 4, index 4 - contains "Product ID")
+  let headerIdx = -1
+  for (let i = 0; i < Math.min(lines.length, 15); i++) {
+    if (lines[i].includes('Product ID') && lines[i].includes('Product Name')) {
+      headerIdx = i
+      break
+    }
   }
-  return rows
+  if (headerIdx < 0) return { headers: [], rows: [] }
+
+  const headers = lines[headerIdx].split('\t').map(h => h.trim())
+  const rows = []
+  
+  // Data starts 3 lines after header (skip mandatory/description rows)
+  for (let i = headerIdx + 3; i < lines.length; i++) {
+    const parts = lines[i].split('\t')
+    if (!parts[0].trim() || !/^\d+$/.test(parts[0].trim())) continue
+    const row = {}
+    headers.forEach((h, j) => { row[h] = (parts[j] || '').trim() })
+    rows.push(row)
+  }
+  return { headers, rows }
+}
+
+// ── Parse Lazada-style text ────────────────────────────────────
+function parseLazadaText(text) {
+  const lines = text.split('\n').map(l => l.replace(/\r$/, ''))
+  
+  // Lazada header is at line 2 (index 2)
+  let headerIdx = -1
+  for (let i = 0; i < Math.min(lines.length, 10); i++) {
+    if (lines[i].includes('Product ID') || lines[i].includes('SellerSKU')) {
+      headerIdx = i
+      break
+    }
+  }
+  if (headerIdx < 0) return { headers: [], rows: [] }
+
+  const headers = lines[headerIdx].split('\t').map(h => h.trim())
+  const rows = []
+  
+  for (let i = headerIdx + 3; i < lines.length; i++) {
+    const parts = lines[i].split('\t')
+    if (!parts[0].trim()) continue
+    const row = {}
+    headers.forEach((h, j) => { row[h] = (parts[j] || '').trim() })
+    rows.push(row)
+  }
+  return { headers, rows }
 }
 
 // ── Generate SQL (same logic as manual imports) ───────────────
-function generateShopeeSQL(salesRows, mediaRows, platform) {
-  const currency = platform.includes('MY') ? 'RM' : 'SGD'
-  const prefix   = platform.includes('MY') ? 'SHPMY' : 'SHPSG'
-  const batchTag = platform.includes('MY') ? 'LOT-SHPMY-IMPORT' : 'LOT-SHPSG-IMPORT'
+function generateSQL(salesRows, mediaRows, platform, fileType) {
+  const isShopee  = platform.startsWith('Shopee')
+  const isMY      = platform.includes('MY')
+  const currency  = isMY ? 'RM' : 'SGD'
+  const prefix    = isShopee ? (isMY ? 'SHPMY' : 'SHPSG') : (isMY ? 'LZMY' : 'LZSG')
+  const batchTag  = `LOT-${prefix}-IMPORT`
 
-  // Build media map: pid -> cover url
+  // Media/image map
   const mediaMap = {}
   mediaRows.forEach(r => {
     const pid = r['Product ID']
-    if (pid) mediaMap[pid] = r['Cover image'] || r['ps_item_cover_image'] || ''
+    if (pid) mediaMap[pid] = r['Cover image'] || r['Product Images1'] || ''
   })
 
   // Group by Product ID
@@ -90,10 +133,9 @@ function generateShopeeSQL(salesRows, mediaRows, platform) {
   })
 
   const seenSkus = {}
-  const dedupSku = (sku) => {
+  const dedupSku = sku => {
     if (!seenSkus[sku]) { seenSkus[sku] = 0; return sku }
-    seenSkus[sku]++
-    return `${sku}-${seenSkus[sku]}`
+    return `${sku}-${++seenSkus[sku]}`
   }
 
   const pRows = [], bRows = []
@@ -107,165 +149,91 @@ function generateShopeeSQL(salesRows, mediaRows, platform) {
     const imgSql  = cover ? `'${cover.replace(/'/g, "''")}'` : 'NULL'
 
     if (variants.length === 1 && !first['Variation Name']) {
-      const v     = variants[0]
-      const raw   = v['SKU'] || `${prefix}-${pid.slice(-10)}`
-      const sku   = dedupSku(safeSku(raw) || `${prefix}-${pid.slice(-10)}`)
-      const qty   = parseInt(v['Stock'] || v['Quantity'] || '0') || 0
-      const price = parseFloat(v['Price'] || '0') || 0
-      const vid   = genUUID()
-      const shpSku = (v['SKU'] || '').replace(/'/g, "''")
-
-      pRows.push(`('${vid}'::uuid, NULL::uuid, '${cname}', NULL, '${sku}', ` +
-        `${price.toFixed(2)}, ${price.toFixed(2)}, '${shpSku}', NULL, ` +
-        `30, 30, false, '${platform}', '${cat}', ${imgSql})`)
-      if (qty > 0) bRows.push({ vid, sku, qty, price, tag: batchTag })
-    } else {
-      const parentId = genUUID()
-      const psku     = dedupSku(`${prefix}-${pid.slice(-10)}-P`)
-      pRows.push(`('${parentId}'::uuid, NULL::uuid, '${cname}', NULL, '${psku}', ` +
-        `0, 0, '${pid}', NULL, 30, 30, false, '${platform}', '${cat}', ${imgSql})`)
-
-      variants.forEach((v, i) => {
-        const vid   = genUUID()
-        const vname = (v['Variation Name'] || `Variant ${i+1}`).replace(/'/g, "''").slice(0, 80)
-        const raw   = v['SKU'] || `${prefix}-${pid.slice(-10)}-V${i}`
-        const vsku  = dedupSku(safeSku(raw) || `${prefix}-${pid.slice(-10)}-V${i}`)
-        const qty   = parseInt(v['Stock'] || v['Quantity'] || '0') || 0
-        const price = parseFloat(v['Price'] || '0') || 0
-        const shpSku = (v['SKU'] || '').replace(/'/g, "''")
-
-        pRows.push(`('${vid}'::uuid, '${parentId}'::uuid, '${cname}', '${vname}', '${vsku}', ` +
-          `${price.toFixed(2)}, ${price.toFixed(2)}, '${shpSku}', NULL, ` +
-          `30, 30, false, '${platform}', '${cat}', ${imgSql})`)
-        if (qty > 0) bRows.push({ vid, sku: vsku, qty, price, tag: batchTag })
-      })
-    }
-  })
-
-  return { pRows, bRows, currency }
-}
-
-function generateLazadaSQL(priceRows, basicRows, imgRows, platform) {
-  const currency = platform.includes('MY') ? 'RM' : 'SGD'
-  const batchTag = platform.includes('MY') ? 'LOT-LZMY-IMPORT' : 'LOT-LZSG-IMPORT'
-
-  const basicMap = {}
-  basicRows.forEach(r => { if (r['Product ID']) basicMap[r['Product ID']] = r })
-
-  const imgMap = {}
-  imgRows.forEach(r => { if (r['SellerSKU']) imgMap[r['SellerSKU']] = r['Images1'] || '' })
-
-  const groups = {}
-  priceRows.forEach(r => {
-    const pid = r['Product ID']
-    if (!pid) return
-    if (!groups[pid]) groups[pid] = []
-    groups[pid].push(r)
-  })
-
-  const seenSkus = {}
-  const dedupSku = (sku) => {
-    if (!seenSkus[sku]) { seenSkus[sku] = 0; return sku }
-    seenSkus[sku]++
-    return `${sku}-${seenSkus[sku]}`
-  }
-
-  const pRows = [], bRows = []
-
-  Object.entries(groups).forEach(([pid, variants]) => {
-    const b       = basicMap[pid] || {}
-    const rawName = b['Product Name'] || variants[0]['Product Name'] || ''
-    const cname   = cleanName(rawName)
-    const cat     = getCategory(rawName)
-    const cover   = b['Product Images1'] || ''
-
-    if (variants.length === 1) {
       const v      = variants[0]
-      const selSku = v['SellerSKU'] || ''
-      const sku    = dedupSku(safeSku(selSku) || `LZ-${pid.slice(-10)}`)
-      const qty    = parseInt(v['Quantity'] || '0') || 0
+      const rawSku = v['SKU'] || v['SellerSKU'] || `${prefix}-${pid.slice(-10)}`
+      const sku    = dedupSku(safeSku(rawSku) || `${prefix}-${pid.slice(-10)}`)
+      const qty    = parseInt(v['Stock'] || v['Quantity'] || '0') || 0
       const price  = parseFloat(v['Price'] || '0') || 0
-      const img    = imgMap[selSku] || cover
-      const imgSql = img ? `'${img.replace(/'/g,"''")}' ` : 'NULL'
-      const vid    = genUUID()
-      const lzSku  = selSku.replace(/'/g,"''")
+      const vid    = crypto.randomUUID()
+      const pSku   = isShopee
+        ? (v['SKU'] || '').replace(/'/g, "''")
+        : ''
+      const lSku   = !isShopee
+        ? (v['SellerSKU'] || '').replace(/'/g, "''")
+        : ''
 
-      pRows.push(`('${vid}'::uuid, NULL::uuid, '${cname}', NULL, '${sku}', ` +
-        `${price.toFixed(2)}, ${price.toFixed(2)}, NULL, '${lzSku}', ` +
-        `30, 30, false, '${platform}', '${cat}', ${imgSql})`)
+      pRows.push(
+        `('${vid}'::uuid, NULL::uuid, '${cname}', NULL, '${sku}', ` +
+        `${price.toFixed(2)}, ${price.toFixed(2)}, '${pSku}', '${lSku}', ` +
+        `30, 30, false, '${platform}', '${cat}', ${imgSql})`
+      )
       if (qty > 0) bRows.push({ vid, sku, qty, price, tag: batchTag })
+
     } else {
-      const parentId = genUUID()
-      const psku     = dedupSku(`LZ-${pid.slice(-10)}-P`)
-      const imgSql   = cover ? `'${cover.replace(/'/g,"''")}'` : 'NULL'
-      pRows.push(`('${parentId}'::uuid, NULL::uuid, '${cname}', NULL, '${psku}', ` +
-        `0, 0, NULL, '${pid}', 30, 30, false, '${platform}', '${cat}', ${imgSql})`)
+      const parentId = crypto.randomUUID()
+      const psku     = dedupSku(`${prefix}-${pid.slice(-10)}-P`)
+      pRows.push(
+        `('${parentId}'::uuid, NULL::uuid, '${cname}', NULL, '${psku}', ` +
+        `0, 0, '${pid}', '', 30, 30, false, '${platform}', '${cat}', ${imgSql})`
+      )
 
       variants.forEach((v, i) => {
-        const vid    = genUUID()
-        const vname  = (v['Variations Combo'] || `Variant ${i+1}`).replace(/'/g,"''").slice(0,80)
-        const selSku = v['SellerSKU'] || ''
-        const vsku   = dedupSku(safeSku(selSku) || `LZ-${pid.slice(-10)}-V${i}`)
-        const qty    = parseInt(v['Quantity'] || '0') || 0
+        const vid    = crypto.randomUUID()
+        const vname  = (v['Variation Name'] || v['Variations Combo'] || `Variant ${i+1}`)
+          .replace(/'/g, "''").slice(0, 80)
+        const rawSku = v['SKU'] || v['SellerSKU'] || `${prefix}-${pid.slice(-10)}-V${i}`
+        const vsku   = dedupSku(safeSku(rawSku) || `${prefix}-${pid.slice(-10)}-V${i}`)
+        const qty    = parseInt(v['Stock'] || v['Quantity'] || '0') || 0
         const price  = parseFloat(v['Price'] || '0') || 0
-        const img    = imgMap[selSku] || cover
-        const imgSql = img ? `'${img.replace(/'/g,"''")}'` : 'NULL'
-        const lzSku  = selSku.replace(/'/g,"''")
+        const pSku   = isShopee ? (v['SKU'] || '').replace(/'/g, "''") : ''
+        const lSku   = !isShopee ? (v['SellerSKU'] || '').replace(/'/g, "''") : ''
+        const vImg   = cover
+        const vImgSql = vImg ? `'${vImg.replace(/'/g, "''")}'` : 'NULL'
 
-        pRows.push(`('${vid}'::uuid, '${parentId}'::uuid, '${cname}', '${vname}', '${vsku}', ` +
-          `${price.toFixed(2)}, ${price.toFixed(2)}, NULL, '${lzSku}', ` +
-          `30, 30, false, '${platform}', '${cat}', ${imgSql})`)
+        pRows.push(
+          `('${vid}'::uuid, '${parentId}'::uuid, '${cname}', '${vname}', '${vsku}', ` +
+          `${price.toFixed(2)}, ${price.toFixed(2)}, '${pSku}', '${lSku}', ` +
+          `30, 30, false, '${platform}', '${cat}', ${vImgSql})`
+        )
         if (qty > 0) bRows.push({ vid, sku: vsku, qty, price, tag: batchTag })
       })
     }
-  })
-
-  return { pRows, bRows, currency }
-}
-
-function buildFinalSQL(pRows, bRows, platform, currency) {
-  const batchLines = bRows.map(({ vid, sku, qty, price, tag }) => {
-    const bid    = genUUID()
-    const cost   = (price * 0.5).toFixed(2)
-    const skuEsc = sku.replace(/'/g, "''")
-    return `INSERT INTO batches (id,product_id,batch_no,qty,received_date,expiry_date,cost)\n` +
-           `SELECT '${bid}'::uuid, id, '${tag}', ${qty}, CURRENT_DATE, NULL, ${cost}\n` +
-           `FROM products WHERE sku='${skuEsc}' LIMIT 1;`
   })
 
   const totalStock = bRows.reduce((s, r) => s + r.qty, 0)
 
-  return {
-    step1: `-- ============================================================
--- StockEasy: ${platform} 产品导入（自动生成）
--- 产品/变体: ${pRows.length} 条 | 货币: ${currency}
--- 生成时间: ${new Date().toLocaleString()}
--- ============================================================
+  const batchLines = bRows.map(({ vid, sku, qty, price, tag }) => {
+    const bid    = crypto.randomUUID()
+    const cost   = (price * 0.5).toFixed(2)
+    const skuEsc = sku.replace(/'/g, "''")
+    return (
+      `INSERT INTO batches (id,product_id,batch_no,qty,received_date,expiry_date,cost)\n` +
+      `SELECT '${bid}'::uuid, id, '${tag}', ${qty}, CURRENT_DATE, NULL, ${cost}\n` +
+      `FROM products WHERE sku='${skuEsc}' LIMIT 1;`
+    )
+  })
 
-ALTER TABLE products ADD COLUMN IF NOT EXISTS category  TEXT DEFAULT '其他';
-ALTER TABLE products ADD COLUMN IF NOT EXISTS photo_url TEXT;
+  const step1 =
+    `-- StockEasy: ${platform} 导入 | ${pRows.length} 产品 | ${currency}\n` +
+    `-- 生成时间: ${new Date().toLocaleString()}\n\n` +
+    `ALTER TABLE products ADD COLUMN IF NOT EXISTS category  TEXT DEFAULT '其他';\n` +
+    `ALTER TABLE products ADD COLUMN IF NOT EXISTS photo_url TEXT;\n\n` +
+    `INSERT INTO products\n` +
+    `  (id, parent_id, name, variant_name, sku, cost, price,\n` +
+    `   shopee_sku, lazada_sku, min_stock, reorder_days, has_expiry,\n` +
+    `   platform, category, photo_url)\nVALUES\n` +
+    pRows.join(',\n') +
+    `\nON CONFLICT (sku) DO NOTHING;\n\n` +
+    `SELECT COUNT(*) as "导入产品数" FROM products WHERE platform = '${platform}';`
 
-INSERT INTO products
-  (id, parent_id, name, variant_name, sku, cost, price,
-   shopee_sku, lazada_sku, min_stock, reorder_days, has_expiry,
-   platform, category, photo_url)
-VALUES
-${pRows.join(',\n')}
-ON CONFLICT (sku) DO NOTHING;
+  const step2 =
+    `-- StockEasy: ${platform} 库存批次 | ${batchLines.length} 批 | ${totalStock} 件\n` +
+    `-- 成本暂用售价50%，请在产品页更新\n\n` +
+    batchLines.join('\n\n')
 
-SELECT COUNT(*) as "导入产品数" FROM products WHERE platform = '${platform}';`,
-
-    step2: `-- ============================================================
--- StockEasy: ${platform} 库存批次（步骤2，Step1成功后运行）
--- 批次数: ${batchLines.length} | 总库存: ${totalStock} 件
--- 成本暂用售价50%，请在产品页更新实际成本
--- ============================================================
-
-${batchLines.join('\n\n')}`
-  }
+  return { step1, step2, pCount: pRows.length, bCount: batchLines.length, totalStock, currency }
 }
 
-// ── Download helper ───────────────────────────────────────────
 function downloadSQL(content, filename) {
   const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
   const url  = URL.createObjectURL(blob)
@@ -277,239 +245,229 @@ function downloadSQL(content, filename) {
 // ════════════════════════════════════════════════════════════════
 export default function ImportPage({ shout }) {
   const [platform,   setPlatform]   = useState('Shopee MY')
-  const [files,      setFiles]      = useState({})
+  const [salesFile,  setSalesFile]  = useState(null)
+  const [mediaFile,  setMediaFile]  = useState(null)
   const [processing, setProcessing] = useState(false)
   const [result,     setResult]     = useState(null)
-  const [step,       setStep]       = useState(1)
+  const [logs,       setLogs]       = useState([])
 
   const isShopee = platform.startsWith('Shopee')
-  const isLazada = platform.startsWith('Lazada')
 
-  const FILE_SLOTS = isShopee
-    ? [
-        { key:'sales',  label:'Sales/Inventory Info Excel', desc:'Mass Update → Sales Info 或 Inventory Info' },
-        { key:'media',  label:'Media Info Excel',            desc:'Mass Update → Media Info' },
-      ]
-    : [
-        { key:'price',  label:'Price & Stock Excel',         desc:'Seller Centre → Manage Products → Export → pricestock' },
-        { key:'basic',  label:'Basic Info Excel',             desc:'Manage Products → Export → basic' },
-        { key:'skuimg', label:'SKU Image Excel (optional)',   desc:'Manage Products → Export → skuimg' },
-      ]
-
-  const handleFile = (key, e) => {
-    const file = e.target.files[0]
-    if (!file) return
-    setFiles(prev => ({ ...prev, [key]: file }))
-  }
-
-  const allUploaded = FILE_SLOTS.filter(s => !s.label.includes('optional')).every(s => files[s.key])
+  const addLog = msg => setLogs(prev => [...prev, msg])
 
   const processFiles = async () => {
+    if (!salesFile) { shout('请先上传主文件', true); return }
     setProcessing(true)
+    setResult(null)
+    setLogs([])
+
     try {
-      const readFile = (file) => new Promise((res, rej) => {
-        const reader = new FileReader()
-        reader.onload = e => res(new Uint8Array(e.target.result))
-        reader.onerror = rej
-        reader.readAsArrayBuffer(file)
-      })
+      addLog('读取文件中…')
+      const salesText = await readFileAsText(salesFile)
+      const mediaText = mediaFile ? await readFileAsText(mediaFile) : ''
 
-      let pRows, bRows, currency
+      addLog('解析数据结构…')
+      const { rows: salesRows } = isShopee
+        ? parseShopeeText(salesText)
+        : parseLazadaText(salesText)
 
-      if (isShopee) {
-        const salesBuf = await readFile(files.sales)
-        const mediaBuf = files.media ? await readFile(files.media) : null
-        const salesRows = parseExcel(salesBuf)
-        const mediaRows = mediaBuf ? parseExcel(mediaBuf) : []
-        ;({ pRows, bRows, currency } = generateShopeeSQL(salesRows, mediaRows, platform))
-      } else {
-        const priceBuf  = await readFile(files.price)
-        const basicBuf  = await readFile(files.basic)
-        const imgBuf    = files.skuimg ? await readFile(files.skuimg) : null
-        const priceRows = parseExcel(priceBuf, 2)
-        const basicRows = parseExcel(basicBuf, 2)
-        const imgRows   = imgBuf ? parseExcel(imgBuf, 2) : []
-        ;({ pRows, bRows, currency } = generateLazadaSQL(priceRows, basicRows, imgRows, platform))
+      const { rows: mediaRows } = mediaText
+        ? (isShopee ? parseShopeeText(mediaText) : parseLazadaText(mediaText))
+        : { rows: [] }
+
+      addLog(`找到 ${salesRows.length} 行产品数据，${mediaRows.length} 行图片数据`)
+
+      if (salesRows.length === 0) {
+        shout('无法读取产品数据，请确认文件格式正确', true)
+        setProcessing(false)
+        return
       }
 
-      const sql = buildFinalSQL(pRows, bRows, platform, currency)
-      setResult({ sql, pRows, bRows, platform, currency })
-      shout(`✓ 已生成 ${pRows.length} 个产品，${bRows.length} 笔库存`)
+      addLog('生成 SQL…')
+      const sql = generateSQL(salesRows, mediaRows, platform)
+      setResult(sql)
+      addLog(`✅ 完成！${sql.pCount} 个产品，${sql.bCount} 笔库存`)
+      shout(`✓ 生成成功：${sql.pCount} 个产品，${sql.totalStock} 件库存`)
+
     } catch (e) {
-      shout('处理失败：' + (e.message || ''), true)
+      addLog(`❌ 错误：${e.message}`)
+      shout('处理失败：' + (e.message || '请检查文件格式'), true)
       console.error(e)
     }
     setProcessing(false)
   }
 
-  const totalStock = result?.bRows.reduce((s,r) => s + r.qty, 0) || 0
-
   return (
     <div>
       {/* Header */}
-      <div style={{ ...S.card, background: C.navy }}>
-        <div style={{ color: C.orange, fontWeight: 700, fontSize: 15, marginBottom: 4 }}>
+      <div style={{ ...S.card, background:C.navy }}>
+        <div style={{ color:C.orange, fontWeight:700, fontSize:15, marginBottom:4 }}>
           📥 Excel 导入工具
         </div>
-        <div style={{ color: C.slateLight, fontSize: 12, lineHeight: 1.6 }}>
-          上传平台 Excel → 自动生成 SQL → 在 Supabase 运行
+        <div style={{ color:C.slateLight, fontSize:11, lineHeight:1.6 }}>
+          上传平台 Excel → 生成 SQL → 在 Supabase 运行导入
         </div>
       </div>
 
-      {/* Step 1: Platform */}
+      {/* Platform selector */}
       <div style={S.card}>
-        <div style={S.secTitle}>步骤 1：选择平台</div>
-        <div style={{ display:'flex', flexWrap:'wrap', gap:8 }}>
+        <div style={S.secTitle}>选择平台</div>
+        <div style={{ display:'flex', flexWrap:'wrap', gap:8, marginBottom:10 }}>
           {['Shopee MY','Shopee SG','Lazada MY','Lazada SG'].map(p => (
-            <button key={p} onClick={() => { setPlatform(p); setFiles({}); setResult(null) }}
-              style={{
-                padding:'8px 16px', borderRadius:20, border:'none', cursor:'pointer',
-                background: platform===p ? C.orange : C.cream,
-                color:      platform===p ? '#fff'   : C.slate,
-                fontWeight: platform===p ? 700 : 400, fontSize: 13,
-              }}>
+            <button key={p} onClick={() => { setPlatform(p); setSalesFile(null); setMediaFile(null); setResult(null); setLogs([]) }}
+              style={{ padding:'8px 16px', borderRadius:20, border:'none', cursor:'pointer',
+                background:platform===p?C.orange:C.cream,
+                color:platform===p?'#fff':C.slate,
+                fontWeight:platform===p?700:400, fontSize:12 }}>
               {p}
             </button>
           ))}
         </div>
-        <div style={{ marginTop:10, fontSize:11, color:C.slate }}>
+        <div style={{ fontSize:11, color:C.slate }}>
           货币：<strong style={{ color:C.orange }}>
-            {platform.includes('MY') ? 'RM (Malaysian Ringgit)' : 'SGD (Singapore Dollar)'}
+            {platform.includes('MY') ? 'RM' : 'SGD'}
           </strong>
         </div>
       </div>
 
-      {/* Step 2: Upload files */}
+      {/* File upload */}
       <div style={S.card}>
-        <div style={S.secTitle}>步骤 2：上传 Excel 文件</div>
-        {FILE_SLOTS.map(slot => (
-          <div key={slot.key} style={{ marginBottom:14 }}>
-            <label style={{ ...S.lbl, fontSize:12 }}>
-              {slot.label}
-              {slot.label.includes('optional') && (
-                <span style={{ color:C.slateLight, fontWeight:400 }}> (选填)</span>
-              )}
-            </label>
-            <div style={{ fontSize:10, color:C.slateLight, marginBottom:5 }}>{slot.desc}</div>
-            <div style={{
-              display:'flex', alignItems:'center', gap:10,
-              padding:'10px 12px', borderRadius:8, border:`1.5px dashed ${files[slot.key]?C.green:C.slateLight}50`,
-              background: files[slot.key] ? C.green+'08' : C.cream, cursor:'pointer',
-            }}
-              onClick={() => document.getElementById(`file-${slot.key}`).click()}>
-              <span style={{ fontSize:20 }}>{files[slot.key] ? '✅' : '📄'}</span>
-              <div>
-                <div style={{ fontSize:12, fontWeight:600, color:files[slot.key]?C.green:C.slate }}>
-                  {files[slot.key] ? files[slot.key].name : '点击选择文件'}
-                </div>
-                {files[slot.key] && (
-                  <div style={{ fontSize:10, color:C.slate }}>
-                    {(files[slot.key].size / 1024).toFixed(0)} KB
-                  </div>
-                )}
-              </div>
-              <input id={`file-${slot.key}`} type="file" accept=".xlsx,.xls,.csv"
-                style={{ display:'none' }} onChange={e => handleFile(slot.key, e)} />
-            </div>
-          </div>
-        ))}
+        <div style={S.secTitle}>上传文件</div>
 
-        <button onClick={processFiles} disabled={!allUploaded || processing}
-          style={{
-            ...S.btn(allUploaded && !processing ? C.green : C.slateLight),
-            opacity: allUploaded ? 1 : 0.5,
-          }}>
+        {/* Main file */}
+        <div style={{ marginBottom:14 }}>
+          <label style={{ ...S.lbl, fontSize:12 }}>
+            {isShopee ? 'Sales Info / Inventory Info Excel *' : 'Price & Stock Excel *'}
+          </label>
+          <div style={{ fontSize:10, color:C.slateLight, marginBottom:6 }}>
+            {isShopee
+              ? 'Seller Centre → Batch Tools → Mass Update → Sales Info 或 Inventory Info'
+              : 'Seller Centre → Manage Products → Export → pricestock'}
+          </div>
+          <label style={{ display:'flex', alignItems:'center', gap:10, padding:'12px',
+                          borderRadius:8, border:`1.5px dashed ${salesFile?C.green:C.slateLight}60`,
+                          background:salesFile?C.green+'08':C.cream, cursor:'pointer' }}>
+            <span style={{ fontSize:22 }}>{salesFile ? '✅' : '📄'}</span>
+            <div>
+              <div style={{ fontSize:12, fontWeight:600, color:salesFile?C.green:C.slate }}>
+                {salesFile ? salesFile.name : '点击选择文件 (.xlsx)'}
+              </div>
+              {salesFile && <div style={{ fontSize:10, color:C.slate }}>{(salesFile.size/1024).toFixed(0)} KB</div>}
+            </div>
+            <input type="file" accept=".xlsx,.xls,.csv,.txt" style={{ display:'none' }}
+              onChange={e => { setSalesFile(e.target.files[0]); setResult(null); setLogs([]) }} />
+          </label>
+        </div>
+
+        {/* Media file */}
+        <div style={{ marginBottom:14 }}>
+          <label style={{ ...S.lbl, fontSize:12 }}>
+            {isShopee ? 'Media Info Excel（选填，用于图片）' : 'Basic Info Excel（选填，用于图片）'}
+          </label>
+          <div style={{ fontSize:10, color:C.slateLight, marginBottom:6 }}>
+            {isShopee
+              ? 'Mass Update → Media Info'
+              : 'Manage Products → Export → basic'}
+          </div>
+          <label style={{ display:'flex', alignItems:'center', gap:10, padding:'12px',
+                          borderRadius:8, border:`1.5px dashed ${mediaFile?C.blue:C.slateLight}40`,
+                          background:mediaFile?C.blue+'08':C.cream, cursor:'pointer' }}>
+            <span style={{ fontSize:22 }}>{mediaFile ? '🖼️' : '📷'}</span>
+            <div>
+              <div style={{ fontSize:12, color:mediaFile?C.blue:C.slate }}>
+                {mediaFile ? mediaFile.name : '点击选择（可跳过）'}
+              </div>
+            </div>
+            <input type="file" accept=".xlsx,.xls,.csv,.txt" style={{ display:'none' }}
+              onChange={e => { setMediaFile(e.target.files[0]); setResult(null) }} />
+          </label>
+        </div>
+
+        <button onClick={processFiles} disabled={!salesFile || processing}
+          style={{ ...S.btn(!salesFile||processing ? C.slateLight : C.green),
+                   opacity: salesFile&&!processing ? 1 : 0.5 }}>
           {processing ? '⏳ 处理中…' : '⚙️ 生成导入 SQL'}
         </button>
+
+        {/* Log */}
+        {logs.length > 0 && (
+          <div style={{ marginTop:10, background:C.navyLight, borderRadius:8, padding:'10px 12px' }}>
+            {logs.map((l,i) => (
+              <div key={i} style={{ fontSize:11, color:C.cream, marginBottom:2 }}>
+                {l.startsWith('✅') ? <span style={{ color:C.green }}>{l}</span>
+                : l.startsWith('❌') ? <span style={{ color:C.red }}>{l}</span>
+                : <span style={{ color:C.slateLight }}>{l}</span>}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
-      {/* Step 3: Result */}
+      {/* Result */}
       {result && (
         <div>
-          {/* Summary */}
+          {/* Stats */}
           <div style={{ ...S.card, background:C.navy }}>
-            <div style={{ color:C.orange, fontWeight:700, marginBottom:8 }}>✅ SQL 已生成</div>
+            <div style={{ color:C.green, fontWeight:700, fontSize:14, marginBottom:8 }}>✅ SQL 生成成功</div>
             <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
               {[
-                [result.pRows.length, '产品/变体'],
-                [result.bRows.length, '库存批次'],
-                [totalStock,          '总库存件数'],
-                [result.currency,     '货币'],
+                [result.pCount,     '产品/变体'],
+                [result.bCount,     '库存批次'],
+                [result.totalStock, '总库存件数'],
+                [result.currency,   '货币'],
               ].map(([v,l]) => (
                 <div key={l} style={{ background:C.navyMid, borderRadius:8, padding:'8px 10px' }}>
-                  <div style={{ fontSize:18, fontWeight:900, color:C.orange }}>{v}</div>
+                  <div style={{ fontSize:20, fontWeight:900, color:C.orange }}>{v}</div>
                   <div style={{ fontSize:10, color:C.slateLight }}>{l}</div>
                 </div>
               ))}
             </div>
           </div>
 
-          {/* Important notes */}
+          {/* Warning */}
           <div style={{ ...S.card, border:`1px solid ${C.yellow}40`, background:C.yellow+'08' }}>
-            <div style={{ fontSize:12, fontWeight:700, color:C.yellow, marginBottom:8 }}>⚠️ 运行前注意</div>
-            {[
-              '先运行 Step 1，看到 Success 后才运行 Step 2',
-              '成本暂用售价 50% 估算，导入后请在产品页更新实际成本',
-              'ON CONFLICT DO NOTHING — 重复 SKU 会自动跳过，安全',
-              `图片来自${result.platform}CDN，产品下架后图片会失效`,
-            ].map((note, i) => (
-              <div key={i} style={{ fontSize:11, color:C.navy, marginBottom:4 }}>
-                {i+1}. {note}
-              </div>
-            ))}
+            <div style={{ fontSize:12, fontWeight:700, color:C.yellow, marginBottom:6 }}>⚠️ 重要</div>
+            <div style={{ fontSize:11, color:C.navy, lineHeight:1.8 }}>
+              1. 先运行 Step 1，看到 Success 后才运行 Step 2<br/>
+              2. 成本暂用售价 50% 估算，导入后请更新实际成本<br/>
+              3. 重复 SKU 自动跳过（ON CONFLICT DO NOTHING）<br/>
+              4. 图片来自平台CDN，产品下架后会失效
+            </div>
           </div>
 
           {/* Download buttons */}
-          <div style={{ display:'flex', gap:8, marginBottom:12 }}>
-            <button onClick={() => downloadSQL(result.sql.step1,
-              `${result.platform.replace(' ','-')}-step1-products.sql`)}
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:12 }}>
+            <button onClick={() => downloadSQL(result.step1,
+              `${platform.replace(' ','-')}-step1-products.sql`)}
               style={S.btn(C.green)}>
-              ⬇ 下载 Step 1（产品）
+              ⬇ Step 1<br/>
+              <span style={{ fontSize:10, fontWeight:400 }}>产品 ({result.pCount}条)</span>
             </button>
-            <button onClick={() => downloadSQL(result.sql.step2,
-              `${result.platform.replace(' ','-')}-step2-batches.sql`)}
+            <button onClick={() => downloadSQL(result.step2,
+              `${platform.replace(' ','-')}-step2-batches.sql`)}
               style={S.btn(C.blue)}>
-              ⬇ 下载 Step 2（库存）
+              ⬇ Step 2<br/>
+              <span style={{ fontSize:10, fontWeight:400 }}>库存 ({result.bCount}条)</span>
             </button>
           </div>
 
-          {/* Supabase instructions */}
+          {/* Supabase steps */}
           <div style={{ ...S.card, background:C.navyLight }}>
-            <div style={{ color:C.orange, fontWeight:700, fontSize:12, marginBottom:10 }}>
-              📋 Supabase 运行步骤
+            <div style={{ color:C.orange, fontWeight:700, fontSize:12, marginBottom:8 }}>
+              📋 Supabase 操作步骤
             </div>
             {[
-              ['1', '打开 Supabase → SQL Editor → New query'],
-              ['2', '贴上 Step 1 内容 → 点 Run → 等待 Success'],
-              ['3', '新建 query → 贴上 Step 2 → 点 Run'],
-              ['4', '查看底部验证结果，确认产品数量正确'],
-            ].map(([n, text]) => (
-              <div key={n} style={{ display:'flex', gap:10, alignItems:'flex-start', marginBottom:8 }}>
-                <div style={{ background:C.orange, color:'#fff', borderRadius:'50%',
-                              width:20, height:20, display:'flex', alignItems:'center',
-                              justifyContent:'center', fontSize:11, fontWeight:700, flexShrink:0 }}>
-                  {n}
-                </div>
-                <div style={{ fontSize:12, color:C.cream, lineHeight:1.5 }}>{text}</div>
+              'SQL Editor → New query → 贴上 Step 1 → Run',
+              '看到 Success → New query → 贴上 Step 2 → Run',
+              '查看验证结果，确认产品数量正确',
+            ].map((t, i) => (
+              <div key={i} style={{ display:'flex', gap:8, alignItems:'flex-start', marginBottom:6 }}>
+                <div style={{ background:C.orange, color:'#fff', borderRadius:'50%', width:18, height:18,
+                              display:'flex', alignItems:'center', justifyContent:'center',
+                              fontSize:10, fontWeight:700, flexShrink:0 }}>{i+1}</div>
+                <div style={{ fontSize:11, color:C.cream }}>{t}</div>
               </div>
             ))}
-          </div>
-
-          {/* Preview */}
-          <div style={S.card}>
-            <div style={S.secTitle}>预览（前5个产品）</div>
-            {result.pRows.slice(0, 5).map((row, i) => {
-              const parts = row.match(/'([^']+)'/g) || []
-              const name  = parts[2]?.replace(/'/g,'') || '—'
-              const sku   = parts[4]?.replace(/'/g,'') || '—'
-              return (
-                <div key={i} style={{ paddingBottom:8, marginBottom:8,
-                    borderBottom: i < 4 ? `1px solid ${C.cream}` : 'none' }}>
-                  <div style={{ fontSize:13, fontWeight:600 }}>{name}</div>
-                  <div style={{ fontSize:10, color:C.slate, fontFamily:'monospace' }}>SKU: {sku}</div>
-                </div>
-              )
-            })}
           </div>
         </div>
       )}
