@@ -1,11 +1,7 @@
 // src/App.jsx
-// Main shell — layout, navigation, and data provider.
-// Individual page components live in src/pages/.
-
 import { useState } from 'react'
 import { useData } from './hooks/useData'
 
-// ── Colours & shared styles ──────────────────────────────────
 export const C = {
   navy:'#0F1B2D', navyMid:'#1A2E48', navyLight:'#243B55',
   orange:'#FF6B35', cream:'#F7F5F0', slate:'#4A6080', slateLight:'#8FA3BC',
@@ -13,7 +9,7 @@ export const C = {
 }
 
 export const S = {
-  inp: { width:'100%', padding:'11px 13px', borderRadius:8, border:`1.5px solid #8FA3BC50`,
+  inp: { width:'100%', padding:'11px 13px', borderRadius:8, border:'1.5px solid #8FA3BC50',
          fontSize:14, outline:'none', boxSizing:'border-box', background:'#fff', fontFamily:'inherit' },
   card: { background:'#fff', borderRadius:12, padding:'15px 16px', marginBottom:12,
           boxShadow:'0 1px 5px rgba(0,0,0,.07)' },
@@ -39,7 +35,6 @@ export const S = {
               textTransform:'uppercase', letterSpacing:.8 },
 }
 
-// ── Small shared components ───────────────────────────────────
 export function Toast({ toast }) {
   if (!toast) return null
   return (
@@ -64,36 +59,37 @@ export function StatusBadge({ stock, min }) {
   )
 }
 
-// ── Lazy-loaded pages ─────────────────────────────────────────
-import Dashboard   from './pages/Dashboard.jsx'
-import ScanPage    from './pages/ScanPage.jsx'
+// ── Page imports ──────────────────────────────────────────────
+import Dashboard    from './pages/Dashboard.jsx'
+import ScanPage     from './pages/ScanPage.jsx'
 import PurchasePage from './pages/PurchasePage.jsx'
-import ReportPage  from './pages/ReportPage.jsx'
+import ReportPage   from './pages/ReportPage.jsx'
 import ProductsPage from './pages/ProductsPage.jsx'
+import ImportPage   from './pages/ImportPage.jsx'
 
+// ── Navigation tabs ───────────────────────────────────────────
 const TABS = [
-  { id:'dashboard', icon:'📊', label:'总览' },
-  { id:'scan',      icon:'🔍', label:'扫码' },
-  { id:'purchase',  icon:'📋', label:'入货' },
-  { id:'report',    icon:'💰', label:'报表' },
+  { id:'dashboard', icon:'📊', label:'总览'  },
+  { id:'scan',      icon:'🔍', label:'扫码'  },
+  { id:'purchase',  icon:'📋', label:'入货'  },
+  { id:'report',    icon:'💰', label:'报表'  },
   { id:'products',  icon:'🗂',  label:'产品' },
-  { id:'import',    icon:'📥', label:'导入' },
+  { id:'import',    icon:'📥', label:'导入'  },
 ]
 
 export default function App() {
-  const data = useData()
-  const [tab, setTab]   = useState('dashboard')
+  const data              = useData()
+  const [tab, setTab]     = useState('dashboard')
   const [toast, setToast] = useState(null)
 
   const shout = (msg, err = false) => {
     setToast({ msg, err })
-    setTimeout(() => setToast(null), 3000)
+    setTimeout(() => setToast(null), 3200)
   }
 
   const expiryAlerts = data.batches.filter(b => {
     if (!b.expiry_date) return false
-    const days = Math.ceil((new Date(b.expiry_date) - new Date()) / 864e5)
-    return days <= 30
+    return Math.ceil((new Date(b.expiry_date) - new Date()) / 864e5) <= 30
   })
 
   const lowStockCount = data.products.filter(p =>
@@ -103,8 +99,8 @@ export default function App() {
   const pageProps = { ...data, shout, setTab }
 
   return (
-    <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:C.cream,
-                  minHeight:'100vh', color:C.navy }}>
+    <div style={{ fontFamily:"'Inter',system-ui,sans-serif",
+                  background:C.cream, minHeight:'100vh', color:C.navy }}>
       <Toast toast={toast} />
 
       {/* Offline banner */}
@@ -145,15 +141,15 @@ export default function App() {
           {data.loading
             ? <div style={{ textAlign:'center', padding:'60px 0', color:C.slate }}>
                 <div style={{ fontSize:32, marginBottom:8 }}>⏳</div>
-                <div>连接数据库中…</div>
+                <div style={{ fontSize:13 }}>连接数据库中…</div>
               </div>
             : <>
-                {tab === 'dashboard' && <Dashboard  {...pageProps} expiryAlerts={expiryAlerts} />}
-                {tab === 'scan'      && <ScanPage   {...pageProps} />}
+                {tab === 'dashboard' && <Dashboard    {...pageProps} expiryAlerts={expiryAlerts} />}
+                {tab === 'scan'      && <ScanPage     {...pageProps} />}
                 {tab === 'purchase'  && <PurchasePage {...pageProps} />}
-                {tab === 'report'    && <ReportPage {...pageProps} />}
+                {tab === 'report'    && <ReportPage   {...pageProps} />}
                 {tab === 'products'  && <ProductsPage {...pageProps} />}
-                {tab === 'import'    && <ImportPage shout={shout} />}
+                {tab === 'import'    && <ImportPage   shout={shout}  />}
               </>}
         </div>
 
@@ -166,13 +162,16 @@ export default function App() {
             const active = tab === t.id
             return (
               <button key={t.id} onClick={() => setTab(t.id)}
-                style={{ flex:1, padding:'9px 2px 7px', border:'none',
+                style={{ flex:1, padding:'8px 2px 6px', border:'none',
                          background: active ? C.navyLight : C.navy,
-                         color: active ? C.orange : C.slateLight,
-                         fontSize:9, fontWeight: active ? 700 : 400, cursor:'pointer',
-                         borderTop: active ? `2px solid ${C.orange}` : '2px solid transparent' }}>
-                <div style={{ fontSize:17 }}>{t.icon}</div>
-                <div>{t.label}</div>
+                         color:      active ? C.orange    : C.slateLight,
+                         fontSize:8, fontWeight: active ? 700 : 400,
+                         cursor:'pointer',
+                         borderTop: active
+                           ? `2px solid ${C.orange}`
+                           : '2px solid transparent' }}>
+                <div style={{ fontSize:15 }}>{t.icon}</div>
+                <div style={{ marginTop:1 }}>{t.label}</div>
               </button>
             )
           })}
