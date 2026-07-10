@@ -149,7 +149,7 @@ export default function App() {
                 {tab === 'purchase'  && <PurchasePage {...pageProps} />}
                 {tab === 'report'    && <ReportPage   {...pageProps} />}
                 {tab === 'products'  && <ProductsPage {...pageProps} />}
-                {tab === 'import'    && <ImportPage   shout={shout}  />}
+                {tab === 'import'    && <ImportPage   shout={shout} refetch={data.refetch} />}
               </>}
         </div>
 
