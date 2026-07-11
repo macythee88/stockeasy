@@ -87,9 +87,13 @@ function parseProducts(salesRows, mediaRows, platform) {
   })
 
   const seenSkus = {}
-  const dedupSku = sku => {
-    if (!seenSkus[sku]) { seenSkus[sku]=0; return sku }
-    return `${sku}-${++seenSkus[sku]}`
+  // SKU always includes platform prefix to avoid cross-platform collisions
+  // e.g. Lazada SG "FullLeg-L" → "LZSG-FullLeg-L"
+  //      Lazada MY "FullLeg-L" → "LZMY-FullLeg-L"
+  const makeSku = (rawSku, fallback) => {
+    const base = rawSku ? `${prefix}-${safeSku(rawSku)}` : fallback
+    if (!seenSkus[base]) { seenSkus[base]=0; return base }
+    return `${base}-${++seenSkus[base]}`
   }
 
   const products=[], batches=[]
@@ -108,7 +112,7 @@ function parseProducts(salesRows, mediaRows, platform) {
     if (isNoVar) {
       const v=variants[0]
       const rawSku=v['SKU']||v['SellerSKU']||''
-      const sku=dedupSku(safeSku(rawSku)||`${prefix}-${pid.slice(-10)}`)
+      const sku=makeSku(rawSku, `${prefix}-${pid.slice(-10)}`)
       const qty=parseInt(v['Stock']||v['Quantity']||'0')||0
       const price=parseFloat(v['Price']||'0')||0
       const img=mediaMap[`sku:${rawSku}`]||cover
@@ -127,7 +131,7 @@ function parseProducts(salesRows, mediaRows, platform) {
       })
     } else {
       const parentId=crypto.randomUUID()
-      const psku=dedupSku(`${prefix}-${pid.slice(-10)}-P`)
+      const psku=makeSku('', `${prefix}-${pid.slice(-10)}-P`)
       products.push({
         id:parentId, parent_id:null, name, variant_name:null, sku:psku,
         cost:0, price:0,
@@ -139,7 +143,7 @@ function parseProducts(salesRows, mediaRows, platform) {
         const vid=crypto.randomUUID()
         const vname=(v['Variation Name']||v['Variations Combo']||`Variant ${i+1}`).slice(0,80)
         const rawSku=v['SKU']||v['SellerSKU']||''
-        const vsku=dedupSku(safeSku(rawSku)||`${prefix}-${pid.slice(-10)}-V${i}`)
+        const vsku=makeSku(rawSku, `${prefix}-${pid.slice(-10)}-V${i}`)
         const qty=parseInt(v['Stock']||v['Quantity']||'0')||0
         const price=parseFloat(v['Price']||'0')||0
         const vimg=mediaMap[`sku:${rawSku}`]||cover
@@ -162,6 +166,9 @@ function parseProducts(salesRows, mediaRows, platform) {
 }
 
 // ── Check duplicates against DB ───────────────────────────────
+// Since SKUs now include platform prefix (e.g. LZMY-xxx vs LZSG-xxx),
+// same raw SKU on different platforms will have different DB SKUs
+// So a simple SKU match is now correct and platform-safe
 async function checkDuplicates(products) {
   const skus = products.map(p=>p.sku).filter(Boolean)
   const CHUNK = 100
@@ -173,7 +180,7 @@ async function checkDuplicates(products) {
       .in('sku', skus.slice(i, i+CHUNK))
     if (data) existing.push(...data)
   }
-  return existing // existing rows in DB that match incoming SKUs
+  return existing
 }
 
 // ── Upload to Supabase ────────────────────────────────────────
