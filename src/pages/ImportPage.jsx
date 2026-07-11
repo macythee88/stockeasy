@@ -1,5 +1,4 @@
 // src/pages/ImportPage.jsx
-// Upload Excel → Parse → Preview & Validate → Direct insert to Supabase
 import { useState } from 'react'
 import { C, S } from '../App'
 import * as XLSX from 'xlsx'
@@ -28,13 +27,13 @@ const CATEGORIES = {
 const getCategory = name => {
   const t = (name||'').toLowerCase()
   for (const [cat,kws] of Object.entries(CATEGORIES))
-    if (kws.some(k => t.includes(k))) return cat
+    if (kws.some(k=>t.includes(k))) return cat
   return '其他'
 }
 const cleanName = n => (n||'').replace(/【.*?】/g,'').trim().slice(0,120)
 const safeSku   = s => (s||'').replace(/[^a-zA-Z0-9\-_]/g,'').slice(0,50)
 
-// ── Read xlsx → rows ──────────────────────────────────────────
+// ── Read xlsx ─────────────────────────────────────────────────
 function readXlsx(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -44,25 +43,19 @@ function readXlsx(file) {
         const wb  = XLSX.read(new Uint8Array(e.target.result), { type:'array' })
         const ws  = wb.Sheets[wb.SheetNames[0]]
         const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:'' })
-
-        // Auto-detect header row (first row containing "Product ID")
         let headerIdx = -1
-        for (let i = 0; i < Math.min(raw.length, 10); i++) {
-          if (raw[i].some(c => String(c).trim() === 'Product ID')) {
-            headerIdx = i; break
-          }
+        for (let i=0; i<Math.min(raw.length,10); i++) {
+          if (raw[i].some(c=>String(c).trim()==='Product ID')) { headerIdx=i; break }
         }
-        if (headerIdx < 0) { resolve([]); return }
-
-        const headers = raw[headerIdx].map(h => String(h||'').trim())
+        if (headerIdx<0) { resolve([]); return }
+        const headers = raw[headerIdx].map(h=>String(h||'').trim())
         const rows = []
-        // Skip header + mandatory + blank rows (usually 3 rows)
-        for (let i = headerIdx + 3; i < raw.length; i++) {
+        for (let i=headerIdx+3; i<raw.length; i++) {
           const r = raw[i]
           const pid = String(r[0]||'').trim()
           if (!pid || !/^\d+$/.test(pid)) continue
           const obj = {}
-          headers.forEach((h,j) => { obj[h] = String(r[j] !== undefined ? r[j] : '').trim() })
+          headers.forEach((h,j)=>{ obj[h]=String(r[j]!==undefined?r[j]:'').trim() })
           rows.push(obj)
         }
         resolve(rows)
@@ -72,7 +65,7 @@ function readXlsx(file) {
   })
 }
 
-// ── Parse into product + batch records ───────────────────────
+// ── Parse products from Excel rows ────────────────────────────
 function parseProducts(salesRows, mediaRows, platform) {
   const isShopee = platform.startsWith('Shopee')
   const isMY     = platform.includes('MY')
@@ -80,18 +73,16 @@ function parseProducts(salesRows, mediaRows, platform) {
   const prefix   = isShopee ? (isMY?'SHPMY':'SHPSG') : (isMY?'LZMY':'LZSG')
   const batchTag = `LOT-${prefix}-IMPORT`
 
-  // Media map
   const mediaMap = {}
   mediaRows.forEach(r => {
-    if (r['Product ID']) mediaMap[r['Product ID']] = r['Cover image'] || r['Product Images1'] || ''
-    if (r['SellerSKU'])  mediaMap[`sku:${r['SellerSKU']}`] = r['Images1'] || ''
+    if (r['Product ID']) mediaMap[r['Product ID']] = r['Cover image']||r['Product Images1']||''
+    if (r['SellerSKU'])  mediaMap[`sku:${r['SellerSKU']}`] = r['Images1']||''
   })
 
-  // Group by Product ID
   const groups = {}
   salesRows.forEach(r => {
-    const pid = r['Product ID']; if (!pid) return
-    if (!groups[pid]) groups[pid] = []
+    const pid=r['Product ID']; if (!pid) return
+    if (!groups[pid]) groups[pid]=[]
     groups[pid].push(r)
   })
 
@@ -101,298 +92,280 @@ function parseProducts(salesRows, mediaRows, platform) {
     return `${sku}-${++seenSkus[sku]}`
   }
 
-  const products = []   // for Supabase products table
-  const batches  = []   // for Supabase batches table
-  const preview  = []   // for UI preview/validation
-  const warnings = []   // validation warnings
+  const products=[], batches=[]
+  const today = new Date().toISOString().split('T')[0]
 
-  Object.entries(groups).forEach(([pid, variants]) => {
-    const first   = variants[0]
-    const rawName = first['Product Name'] || ''
-    const name    = cleanName(rawName)
-    const cat     = getCategory(rawName)
-    const cover   = mediaMap[pid] || ''
+  Object.entries(groups).forEach(([pid,variants]) => {
+    const first=variants[0]
+    const rawName=first['Product Name']||''
+    const name=cleanName(rawName)
+    const cat=getCategory(rawName)
+    const cover=mediaMap[pid]||''
+    if (!name) return
 
-    if (!name) { warnings.push(`Product ID ${pid}: 产品名称为空，已跳过`); return }
+    const isNoVar = variants.length===1 && !first['Variation Name'] && !first['Variations Combo']
 
-    const isNoVariant = variants.length === 1 &&
-      !first['Variation Name'] && !first['Variations Combo']
-
-    if (isNoVariant) {
-      const v      = variants[0]
-      const rawSku = v['SKU'] || v['SellerSKU'] || ''
-      const sku    = dedupSku(safeSku(rawSku) || `${prefix}-${pid.slice(-10)}`)
-      const qty    = parseInt(v['Stock']||v['Quantity']||'0')||0
-      const price  = parseFloat(v['Price']||'0')||0
-      const img    = mediaMap[`sku:${rawSku}`] || cover
-      const vid    = crypto.randomUUID()
-
-      if (!sku) { warnings.push(`${name}: SKU 为空，自动生成`); }
-
+    if (isNoVar) {
+      const v=variants[0]
+      const rawSku=v['SKU']||v['SellerSKU']||''
+      const sku=dedupSku(safeSku(rawSku)||`${prefix}-${pid.slice(-10)}`)
+      const qty=parseInt(v['Stock']||v['Quantity']||'0')||0
+      const price=parseFloat(v['Price']||'0')||0
+      const img=mediaMap[`sku:${rawSku}`]||cover
+      const vid=crypto.randomUUID()
       products.push({
-        id: vid, parent_id: null, name, variant_name: null, sku,
-        cost: price*0.5, price,
-        shopee_sku: isShopee ? rawSku : null,
-        lazada_sku: !isShopee ? rawSku : null,
-        min_stock: 30, reorder_days: 30, has_expiry: false,
-        platform, category: cat, photo_url: img || null
+        id:vid, parent_id:null, name, variant_name:null, sku,
+        cost:parseFloat((price*0.5).toFixed(2)), price,
+        shopee_sku:isShopee?rawSku:null, lazada_sku:!isShopee?rawSku:null,
+        min_stock:30, reorder_days:30, has_expiry:false,
+        platform, category:cat, photo_url:img||null
       })
-      if (qty > 0) batches.push({ id:crypto.randomUUID(), product_id:vid,
-        batch_no:batchTag, qty, received_date:new Date().toISOString().split('T')[0],
-        expiry_date:null, cost: parseFloat((price*0.5).toFixed(2)) })
-      preview.push({ name, sku, price, qty, currency, img, cat, platform, isParent:false })
-
+      if (qty>0) batches.push({
+        id:crypto.randomUUID(), product_id:vid,
+        batch_no:batchTag, qty, received_date:today,
+        expiry_date:null, cost:parseFloat((price*0.5).toFixed(2))
+      })
     } else {
-      const parentId = crypto.randomUUID()
-      const psku     = dedupSku(`${prefix}-${pid.slice(-10)}-P`)
-      const img      = cover
-
+      const parentId=crypto.randomUUID()
+      const psku=dedupSku(`${prefix}-${pid.slice(-10)}-P`)
       products.push({
-        id: parentId, parent_id: null, name, variant_name: null, sku: psku,
-        cost: 0, price: 0,
-        shopee_sku: isShopee ? pid : null,
-        lazada_sku: !isShopee ? pid : null,
-        min_stock: 30, reorder_days: 30, has_expiry: false,
-        platform, category: cat, photo_url: img || null
+        id:parentId, parent_id:null, name, variant_name:null, sku:psku,
+        cost:0, price:0,
+        shopee_sku:isShopee?pid:null, lazada_sku:!isShopee?pid:null,
+        min_stock:30, reorder_days:30, has_expiry:false,
+        platform, category:cat, photo_url:cover||null
       })
-      preview.push({ name, sku:psku, price:0, qty:0, currency, img, cat, platform, isParent:true, variantCount:variants.length })
-
-      variants.forEach((v, i) => {
-        const vid    = crypto.randomUUID()
-        const vname  = (v['Variation Name']||v['Variations Combo']||`Variant ${i+1}`).slice(0,80)
-        const rawSku = v['SKU']||v['SellerSKU']||''
-        const vsku   = dedupSku(safeSku(rawSku)||`${prefix}-${pid.slice(-10)}-V${i}`)
-        const qty    = parseInt(v['Stock']||v['Quantity']||'0')||0
-        const price  = parseFloat(v['Price']||'0')||0
-        const vimg   = mediaMap[`sku:${rawSku}`] || cover
-
+      variants.forEach((v,i) => {
+        const vid=crypto.randomUUID()
+        const vname=(v['Variation Name']||v['Variations Combo']||`Variant ${i+1}`).slice(0,80)
+        const rawSku=v['SKU']||v['SellerSKU']||''
+        const vsku=dedupSku(safeSku(rawSku)||`${prefix}-${pid.slice(-10)}-V${i}`)
+        const qty=parseInt(v['Stock']||v['Quantity']||'0')||0
+        const price=parseFloat(v['Price']||'0')||0
+        const vimg=mediaMap[`sku:${rawSku}`]||cover
         products.push({
-          id: vid, parent_id: parentId, name, variant_name: vname, sku: vsku,
-          cost: parseFloat((price*0.5).toFixed(2)), price,
-          shopee_sku: isShopee ? rawSku : null,
-          lazada_sku: !isShopee ? rawSku : null,
-          min_stock: 30, reorder_days: 30, has_expiry: false,
-          platform, category: cat, photo_url: vimg || null
+          id:vid, parent_id:parentId, name, variant_name:vname, sku:vsku,
+          cost:parseFloat((price*0.5).toFixed(2)), price,
+          shopee_sku:isShopee?rawSku:null, lazada_sku:!isShopee?rawSku:null,
+          min_stock:30, reorder_days:30, has_expiry:false,
+          platform, category:cat, photo_url:vimg||null
         })
-        if (qty > 0) batches.push({ id:crypto.randomUUID(), product_id:vid,
-          batch_no:batchTag, qty, received_date:new Date().toISOString().split('T')[0],
-          expiry_date:null, cost: parseFloat((price*0.5).toFixed(2)) })
-        preview.push({ name:`${name} · ${vname}`, sku:vsku, price, qty, currency, img:vimg, cat, platform, isParent:false })
+        if (qty>0) batches.push({
+          id:crypto.randomUUID(), product_id:vid,
+          batch_no:batchTag, qty, received_date:today,
+          expiry_date:null, cost:parseFloat((price*0.5).toFixed(2))
+        })
       })
     }
   })
-
-  return { products, batches, preview, warnings, currency }
+  return { products, batches, currency }
 }
 
-// ── Validation checks ─────────────────────────────────────────
-function validate(products, batches) {
-  const errors   = []
-  const warnings = []
-  const skus     = products.map(p => p.sku)
-  const dupSkus  = skus.filter((s,i) => skus.indexOf(s) !== i)
-
-  if (dupSkus.length > 0)
-    errors.push(`重复 SKU：${[...new Set(dupSkus)].slice(0,5).join(', ')}`)
-  if (products.some(p => !p.name || p.name.trim() === ''))
-    errors.push('有产品名称为空')
-  if (products.some(p => !p.sku || p.sku.trim() === ''))
-    errors.push('有产品 SKU 为空')
-  if (products.length === 0)
-    errors.push('没有找到任何产品数据')
-
-  const noPrice = products.filter(p => !p.parent_id && p.price === 0).length
-  if (noPrice > 0)
-    warnings.push(`${noPrice} 个产品价格为 0，请确认`)
-
-  const noImg = products.filter(p => !p.photo_url).length
-  if (noImg > 0)
-    warnings.push(`${noImg} 个产品没有图片（请确认是否上传了 Media Info 文件）`)
-
-  return { errors, warnings, valid: errors.length === 0 }
+// ── Check duplicates against DB ───────────────────────────────
+async function checkDuplicates(products) {
+  const skus = products.map(p=>p.sku).filter(Boolean)
+  const CHUNK = 100
+  const existing = []
+  for (let i=0; i<skus.length; i+=CHUNK) {
+    const { data } = await supabase
+      .from('products')
+      .select('id, sku, name, variant_name, platform, price, cost')
+      .in('sku', skus.slice(i, i+CHUNK))
+    if (data) existing.push(...data)
+  }
+  return existing // existing rows in DB that match incoming SKUs
 }
 
 // ── Upload to Supabase ────────────────────────────────────────
-async function uploadToSupabase(products, batches, onProgress) {
-  const results = { inserted:0, skipped:0, batchOk:0, errors:[] }
-
-  // Ensure columns exist
-  onProgress('检查数据库栏位…')
-  await supabase.rpc('exec_sql', {
-    sql: `ALTER TABLE products ADD COLUMN IF NOT EXISTS category TEXT DEFAULT '其他';
-          ALTER TABLE products ADD COLUMN IF NOT EXISTS photo_url TEXT;`
-  }).catch(() => {}) // ignore if rpc doesn't exist, columns may already exist
-
-  // Insert products in chunks of 50
+async function doUpload(products, batches, dupAction, onProgress) {
+  // dupAction: 'skip' | 'overwrite'
   const CHUNK = 50
-  for (let i = 0; i < products.length; i += CHUNK) {
-    const chunk = products.slice(i, i + CHUNK)
-    onProgress(`上传产品 ${i+1}–${Math.min(i+CHUNK, products.length)} / ${products.length}…`)
-    const { error, data } = await supabase
-      .from('products')
-      .upsert(chunk, { onConflict: 'sku', ignoreDuplicates: true })
-    if (error) {
-      results.errors.push(`产品批次 ${i/CHUNK+1} 错误：${error.message}`)
-    } else {
-      results.inserted += chunk.length
+  let inserted=0, skipped=0, updated=0, batchOk=0
+  const errors=[]
+
+  onProgress('上传产品中…')
+
+  if (dupAction === 'overwrite') {
+    // upsert all
+    for (let i=0; i<products.length; i+=CHUNK) {
+      const chunk = products.slice(i,i+CHUNK)
+      onProgress(`覆盖产品 ${i+1}–${Math.min(i+CHUNK,products.length)} / ${products.length}`)
+      const { error } = await supabase.from('products')
+        .upsert(chunk, { onConflict:'sku' })
+      if (error) errors.push(error.message)
+      else updated += chunk.length
+    }
+  } else {
+    // insert only, skip duplicates
+    for (let i=0; i<products.length; i+=CHUNK) {
+      const chunk = products.slice(i,i+CHUNK)
+      onProgress(`新增产品 ${i+1}–${Math.min(i+CHUNK,products.length)} / ${products.length}`)
+      const { error, data } = await supabase.from('products')
+        .upsert(chunk, { onConflict:'sku', ignoreDuplicates:true })
+      if (error) errors.push(error.message)
+      else inserted += chunk.length
     }
   }
 
-  if (results.errors.length > 0) return results
+  if (errors.length>0) return { inserted, updated, skipped, batchOk, errors }
 
-  // Get actual inserted product IDs to correctly link batches
-  onProgress('验证产品 ID…')
-  const skus = [...new Set(batches.map(b => {
-    const p = products.find(x => x.id === b.product_id)
+  // Re-fetch inserted IDs by SKU to correctly link batches
+  onProgress('验证产品 ID，准备写入库存…')
+  const batchSkus = [...new Set(batches.map(b => {
+    const p = products.find(x=>x.id===b.product_id)
     return p?.sku
   }).filter(Boolean))]
 
-  const { data: inserted } = await supabase
-    .from('products')
-    .select('id, sku')
-    .in('sku', skus)
-
   const skuToId = {}
-  ;(inserted || []).forEach(p => { skuToId[p.sku] = p.id })
-
-  // Remap batch product_ids to actual DB ids
-  const remappedBatches = batches.map(b => {
-    const p   = products.find(x => x.id === b.product_id)
-    const dbId = p ? skuToId[p.sku] : null
-    return dbId ? { ...b, product_id: dbId } : null
-  }).filter(Boolean)
-
-  // Insert batches in chunks
-  for (let i = 0; i < remappedBatches.length; i += CHUNK) {
-    const chunk = remappedBatches.slice(i, i + CHUNK)
-    onProgress(`上传库存批次 ${i+1}–${Math.min(i+CHUNK, remappedBatches.length)} / ${remappedBatches.length}…`)
-    const { error } = await supabase.from('batches').insert(chunk)
-    if (error) results.errors.push(`批次错误：${error.message}`)
-    else results.batchOk += chunk.length
+  for (let i=0; i<batchSkus.length; i+=100) {
+    const { data } = await supabase.from('products').select('id,sku')
+      .in('sku', batchSkus.slice(i,i+100))
+    ;(data||[]).forEach(p => { skuToId[p.sku]=p.id })
   }
 
-  return results
+  const remapped = batches.map(b => {
+    const p = products.find(x=>x.id===b.product_id)
+    const dbId = p ? skuToId[p.sku] : null
+    return dbId ? {...b, product_id:dbId} : null
+  }).filter(Boolean)
+
+  for (let i=0; i<remapped.length; i+=CHUNK) {
+    const chunk = remapped.slice(i,i+CHUNK)
+    onProgress(`写入库存批次 ${i+1}–${Math.min(i+CHUNK,remapped.length)} / ${remapped.length}`)
+    const { error } = await supabase.from('batches').insert(chunk)
+    if (error) errors.push('批次错误：'+error.message)
+    else batchOk += chunk.length
+  }
+
+  return { inserted, updated, skipped, batchOk, errors }
 }
 
 // ════════════════════════════════════════════════════════════════
 export default function ImportPage({ shout, refetch }) {
-  const [platform,   setPlatform]   = useState('Shopee MY')
-  const [salesFile,  setSalesFile]  = useState(null)
-  const [mediaFile,  setMediaFile]  = useState(null)
-  const [step,       setStep]       = useState('upload')  // upload|preview|uploading|done
-  const [parsed,     setParsed]     = useState(null)
-  const [validation, setValidation] = useState(null)
-  const [progress,   setProgress]   = useState('')
-  const [uploadResult, setUploadResult] = useState(null)
-  const [logs,       setLogs]       = useState([])
+  const [platform,  setPlatform]  = useState('Shopee MY')
+  const [salesFile, setSalesFile] = useState(null)
+  const [mediaFile, setMediaFile] = useState(null)
+  // steps: upload → checking → conflict → uploading → done
+  const [step,      setStep]      = useState('upload')
+  const [parsed,    setParsed]    = useState(null)       // {products, batches, currency}
+  const [dupInfo,   setDupInfo]   = useState(null)       // {duplicates[], newCount}
+  const [dupAction, setDupAction] = useState(null)       // 'skip'|'overwrite'
+  const [progress,  setProgress]  = useState('')
+  const [uploadRes, setUploadRes] = useState(null)
+  const [logs,      setLogs]      = useState([])
 
-  const isShopee  = platform.startsWith('Shopee')
-  const headerIdx = isShopee ? 4 : 2
+  const isShopee = platform.startsWith('Shopee')
+  const addLog   = msg => setLogs(p=>[...p,msg])
 
-  const addLog = msg => setLogs(p => [...p, msg])
-  const reset  = () => {
+  const reset = () => {
     setSalesFile(null); setMediaFile(null); setParsed(null)
-    setValidation(null); setStep('upload'); setLogs([]); setUploadResult(null)
+    setDupInfo(null); setDupAction(null); setStep('upload')
+    setLogs([]); setUploadRes(null)
   }
 
-  // ── Step 1: Parse & validate ───────────────────────────────
+  // ── Step 1: Parse + check duplicates ──────────────────────
   const handleParse = async () => {
-    if (!salesFile) { shout('请先上传主文件', true); return }
-    setLogs([]); setStep('upload')
+    if (!salesFile) { shout('请先上传主文件',true); return }
+    setLogs([]); setStep('checking')
     try {
       addLog('读取 Excel 文件…')
       const salesRows = await readXlsx(salesFile)
       const mediaRows = mediaFile ? await readXlsx(mediaFile) : []
       addLog(`解析到 ${salesRows.length} 行产品，${mediaRows.length} 行图片`)
 
-      if (salesRows.length === 0) {
+      if (salesRows.length===0) {
         addLog('❌ 无法读取产品数据，请确认文件格式')
-        shout('无法读取数据', true); return
+        shout('无法读取数据',true); setStep('upload'); return
       }
-      addLog(`字段预览：${Object.keys(salesRows[0]).slice(0,5).join(' | ')}`)
+      addLog(`字段：${Object.keys(salesRows[0]).slice(0,5).join(' | ')}`)
 
       addLog('解析产品结构…')
       const result = parseProducts(salesRows, mediaRows, platform)
       addLog(`✅ 解析完成：${result.products.length} 个产品/变体，${result.batches.length} 笔库存`)
 
-      addLog('执行验证检查…')
-      const v = validate(result.products, result.batches)
-      if (v.errors.length > 0) {
-        v.errors.forEach(e => addLog(`❌ 错误：${e}`))
-      }
-      if (v.warnings.length > 0) {
-        v.warnings.forEach(w => addLog(`⚠️ 警告：${w}`))
-      }
-      if (v.valid) addLog('✅ 验证通过，可以上传')
+      addLog('检查数据库是否有重复 SKU…')
+      const existingRows = await checkDuplicates(result.products)
+      addLog(existingRows.length>0
+        ? `⚠️ 发现 ${existingRows.length} 个 SKU 已存在于数据库`
+        : '✅ 没有重复 SKU，全部可以新增')
 
-      setParsed(result); setValidation(v); setStep('preview')
+      const dupSkus = new Set(existingRows.map(r=>r.sku))
+      const newProducts = result.products.filter(p=>!dupSkus.has(p.sku))
+
+      setParsed(result)
+      setDupInfo({ duplicates:existingRows, newCount:newProducts.length })
+      setStep('conflict')
     } catch(e) {
       addLog(`❌ ${e.message}`)
-      shout('解析失败：' + e.message, true)
+      shout('解析失败：'+e.message,true)
+      setStep('upload')
     }
   }
 
-  // ── Step 2: Upload ─────────────────────────────────────────
+  // ── Step 2: Upload with chosen action ─────────────────────
   const handleUpload = async () => {
-    if (!parsed || !validation?.valid) return
-    setStep('uploading'); setProgress('准备上传…')
+    if (!parsed||!dupAction) return
+    setStep('uploading')
     try {
-      const result = await uploadToSupabase(
-        parsed.products, parsed.batches,
-        msg => setProgress(msg)
-      )
-      setUploadResult(result)
+      const res = await doUpload(parsed.products, parsed.batches, dupAction, setProgress)
+      setUploadRes(res)
       setStep('done')
-      if (result.errors.length === 0) {
-        shout(`✅ 上传成功！${result.inserted} 个产品，${result.batchOk} 笔库存`)
+      if (res.errors.length===0) {
+        shout(`✅ 上传成功！产品已写入数据库`)
         refetch && refetch()
       } else {
-        shout(`上传完成，但有 ${result.errors.length} 个错误`, true)
+        shout(`上传完成，有 ${res.errors.length} 个错误`,true)
       }
     } catch(e) {
-      shout('上传失败：' + e.message, true)
-      setStep('preview')
+      shout('上传失败：'+e.message,true)
+      setStep('conflict')
     }
   }
 
-  const totalStock = parsed?.batches.reduce((s,b)=>s+b.qty,0) || 0
+  const totalStock = parsed?.batches.reduce((s,b)=>s+b.qty,0)||0
 
   return (
     <div>
-      {/* Header */}
-      <div style={{...S.card, background:C.navy}}>
-        <div style={{color:C.orange, fontWeight:700, fontSize:15, marginBottom:4}}>
+      {/* Header + step bar */}
+      <div style={{...S.card,background:C.navy}}>
+        <div style={{color:C.orange,fontWeight:700,fontSize:15,marginBottom:4}}>
           📥 Excel 导入工具
         </div>
-        <div style={{color:C.slateLight, fontSize:11, lineHeight:1.7}}>
-          上传 Excel → 自动解析 → 验证检查 → 直接写入数据库
+        <div style={{color:C.slateLight,fontSize:11,lineHeight:1.6,marginBottom:10}}>
+          上传 Excel → 解析 → 检查重复 → 选择处理方式 → 写入数据库
         </div>
         {/* Step indicator */}
-        <div style={{display:'flex', gap:6, marginTop:10}}>
-          {[['1','上传'],['2','预览检查'],['3','写入数据库']].map(([n,l],i) => {
-            const isActive = (step==='upload'&&i===0)||(step==='preview'&&i===1)||
-                             ((step==='uploading'||step==='done')&&i===2)
-            const isDone   = (i===0&&step!=='upload')||(i===1&&(step==='uploading'||step==='done'))
+        <div style={{display:'flex',alignItems:'center',gap:4}}>
+          {[
+            ['upload',   '上传'],
+            ['checking', '解析检查'],
+            ['conflict', '重复处理'],
+            ['uploading','写入'],
+            ['done',     '完成'],
+          ].map(([id,label],i)=>{
+            const steps=['upload','checking','conflict','uploading','done']
+            const curIdx=steps.indexOf(step)
+            const thisIdx=steps.indexOf(id)
+            const isDone=curIdx>thisIdx
+            const isActive=curIdx===thisIdx
             return (
-              <div key={n} style={{display:'flex', alignItems:'center', gap:4}}>
-                <div style={{width:20,height:20,borderRadius:'50%',fontSize:10,fontWeight:700,
-                             display:'flex',alignItems:'center',justifyContent:'center',
-                             background:isDone?C.green:isActive?C.orange:C.navyMid,
-                             color:'#fff'}}>
-                  {isDone ? '✓' : n}
+              <div key={id} style={{display:'flex',alignItems:'center',gap:3}}>
+                <div style={{width:18,height:18,borderRadius:'50%',fontSize:9,fontWeight:700,
+                  display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,
+                  background:isDone?C.green:isActive?C.orange:C.navyMid,color:'#fff'}}>
+                  {isDone?'✓':i+1}
                 </div>
-                <span style={{fontSize:10,color:isActive?C.orange:isDone?C.green:C.slateLight}}>
-                  {l}
-                </span>
-                {i<2&&<span style={{color:C.navyMid,fontSize:10}}>→</span>}
+                <span style={{fontSize:9,color:isActive?C.orange:isDone?C.green:C.slateLight,
+                  whiteSpace:'nowrap'}}>{label}</span>
+                {i<4&&<div style={{width:12,height:1,background:C.navyMid,flexShrink:0}}/>}
               </div>
             )
           })}
         </div>
       </div>
 
-      {/* ── STEP 1: Upload ───────────────────────────────────── */}
-      {(step==='upload'||step==='preview') && (
+      {/* ── UPLOAD ───────────────────────────────────────────── */}
+      {(step==='upload'||step==='checking') && (
         <div style={S.card}>
           <div style={S.secTitle}>选择平台</div>
           <div style={{display:'flex',flexWrap:'wrap',gap:8,marginBottom:12}}>
@@ -407,26 +380,23 @@ export default function ImportPage({ shout, refetch }) {
             ))}
           </div>
 
-          {/* Main file */}
           {[
             {
-              key:'sales', file:salesFile, set:setSalesFile,
-              label: isShopee?'Sales Info / Inventory Info *':'Price & Stock Excel *',
-              desc:  isShopee
+              key:'sales', file:salesFile, set:setSalesFile, required:true,
+              label:isShopee?'Sales Info / Inventory Info Excel *':'Price & Stock Excel *',
+              desc:isShopee
                 ?'Seller Centre → Batch Tools → Mass Update → Sales Info 或 Inventory Info'
                 :'Seller Centre → Manage Products → Export → pricestock',
             },
             {
-              key:'media', file:mediaFile, set:setMediaFile,
-              label: isShopee?'Media Info（选填，含图片）':'Basic Info（选填，含图片）',
-              desc:  isShopee?'Mass Update → Media Info':'Manage Products → Export → basic',
-              optional: true,
+              key:'media', file:mediaFile, set:setMediaFile, required:false,
+              label:isShopee?'Media Info（选填，含图片链接）':'Basic Info（选填，含图片）',
+              desc:isShopee?'Mass Update → Media Info':'Manage Products → Export → basic',
             },
-          ].map(({key,file,set,label,desc,optional})=>(
+          ].map(({key,file,set,required,label,desc})=>(
             <div key={key} style={{marginBottom:12}}>
               <label style={{...S.lbl,fontSize:12}}>
-                {label}
-                {optional&&<span style={{color:C.slateLight,fontWeight:400}}> (选填)</span>}
+                {label}{!required&&<span style={{color:C.slateLight,fontWeight:400}}> (选填)</span>}
               </label>
               <div style={{fontSize:10,color:C.slateLight,marginBottom:5}}>{desc}</div>
               <label style={{display:'flex',alignItems:'center',gap:10,padding:'10px 12px',
@@ -441,17 +411,17 @@ export default function ImportPage({ shout, refetch }) {
                   {file&&<div style={{fontSize:10,color:C.slate}}>{(file.size/1024).toFixed(0)} KB</div>}
                 </div>
                 <input type="file" accept=".xlsx,.xls" style={{display:'none'}}
-                  onChange={e=>{set(e.target.files[0]);setParsed(null);setValidation(null);setStep('upload');setLogs([])}}/>
+                  onChange={e=>{set(e.target.files[0]);setParsed(null);setDupInfo(null);setStep('upload');setLogs([])}}/>
               </label>
             </div>
           ))}
 
-          <button onClick={handleParse} disabled={!salesFile}
-            style={{...S.btn(salesFile?C.orange:C.slateLight),opacity:salesFile?1:0.5}}>
-            🔍 解析并验证
+          <button onClick={handleParse} disabled={!salesFile||step==='checking'}
+            style={{...S.btn(!salesFile||step==='checking'?C.slateLight:C.orange),
+                    opacity:salesFile&&step!=='checking'?1:0.5}}>
+            {step==='checking'?'⏳ 解析检查中…':'🔍 解析并检查重复'}
           </button>
 
-          {/* Parse logs */}
           {logs.length>0&&(
             <div style={{marginTop:10,background:C.navyLight,borderRadius:8,padding:'10px 12px'}}>
               {logs.map((l,i)=>(
@@ -466,142 +436,183 @@ export default function ImportPage({ shout, refetch }) {
         </div>
       )}
 
-      {/* ── STEP 2: Preview & Validate ───────────────────────── */}
-      {step==='preview' && parsed && validation && (
+      {/* ── CONFLICT RESOLUTION ───────────────────────────────── */}
+      {step==='conflict' && parsed && dupInfo && (
         <div>
-          {/* Validation result */}
-          <div style={{...S.card,
-            border:`2px solid ${validation.valid?C.green:C.red}`,
-            background:validation.valid?C.green+'06':C.red+'06'}}>
-            <div style={{fontWeight:700,fontSize:14,
-              color:validation.valid?C.green:C.red,marginBottom:8}}>
-              {validation.valid?'✅ 验证通过，可以上传':'❌ 发现错误，请修正后重新上传'}
+          {/* Summary */}
+          <div style={{...S.card,background:C.navy}}>
+            <div style={{color:C.orange,fontWeight:700,fontSize:14,marginBottom:10}}>
+              📊 解析结果
             </div>
-
-            {/* Stats */}
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:12}}>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
               {[
-                [parsed.products.length,'产品/变体',C.navy],
-                [parsed.batches.length,'库存批次',C.navy],
-                [totalStock,'总库存件数',C.navy],
-                [parsed.products.filter(p=>p.photo_url).length,'有图片',C.blue],
+                [parsed.products.length,   '总产品/变体',   C.orange],
+                [dupInfo.newCount,          '新产品（可新增）',C.green],
+                [dupInfo.duplicates.length, '重复 SKU（已存在）',dupInfo.duplicates.length>0?C.yellow:C.green],
+                [totalStock,               '总库存件数',    C.blue],
               ].map(([v,l,col])=>(
-                <div key={l} style={{background:C.cream,borderRadius:8,padding:'8px 10px'}}>
-                  <div style={{fontSize:18,fontWeight:900,color:col}}>{v}</div>
-                  <div style={{fontSize:10,color:C.slate}}>{l}</div>
+                <div key={l} style={{background:C.navyMid,borderRadius:8,padding:'8px 10px'}}>
+                  <div style={{fontSize:20,fontWeight:900,color:col}}>{v}</div>
+                  <div style={{fontSize:10,color:C.slateLight,lineHeight:1.3}}>{l}</div>
                 </div>
               ))}
             </div>
-
-            {/* Errors */}
-            {validation.errors.map((e,i)=>(
-              <div key={i} style={{fontSize:12,color:C.red,marginBottom:4,
-                padding:'6px 10px',background:C.red+'10',borderRadius:6}}>
-                ❌ {e}
-              </div>
-            ))}
-
-            {/* Warnings */}
-            {validation.warnings.map((w,i)=>(
-              <div key={i} style={{fontSize:12,color:C.yellow,marginBottom:4,
-                padding:'6px 10px',background:C.yellow+'10',borderRadius:6}}>
-                ⚠️ {w}
-              </div>
-            ))}
-
-            {/* Extra notes */}
-            <div style={{fontSize:11,color:C.slate,marginTop:8,lineHeight:1.7}}>
-              • 成本暂用售价 50%，上传后请在产品页更新实际成本<br/>
-              • 重复 SKU 会自动跳过（不覆盖已有产品）<br/>
-              • 图片来自平台 CDN，产品下架后可能失效
-            </div>
           </div>
 
-          {/* Preview table — first 10 products */}
-          <div style={S.card}>
-            <div style={S.secTitle}>
-              产品预览（前 {Math.min(10, parsed.preview.length)} 条，共 {parsed.preview.length} 条）
+          {/* Duplicate list */}
+          {dupInfo.duplicates.length>0 && (
+            <div style={S.card}>
+              <div style={{...S.secTitle,color:C.yellow}}>
+                ⚠️ {dupInfo.duplicates.length} 个 SKU 已存在于数据库
+              </div>
+              <div style={{fontSize:11,color:C.slate,marginBottom:10}}>
+                以下产品的 SKU 在数据库里已有记录，请选择处理方式：
+              </div>
+
+              {/* Duplicate list preview */}
+              <div style={{background:C.cream,borderRadius:8,padding:'8px',marginBottom:12,
+                           maxHeight:220,overflowY:'auto'}}>
+                {dupInfo.duplicates.map((ex,i)=>{
+                  const incoming = parsed.products.find(p=>p.sku===ex.sku)
+                  return (
+                    <div key={i} style={{paddingBottom:8,marginBottom:8,
+                      borderBottom:i<dupInfo.duplicates.length-1?`1px solid #e0e0e0`:'none'}}>
+                      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:4}}>
+                        {/* DB version */}
+                        <div style={{background:'#fff',borderRadius:6,padding:'6px 8px',
+                                     border:`1px solid ${C.slateLight}30`}}>
+                          <div style={{fontSize:9,color:C.slate,marginBottom:2,fontWeight:700}}>
+                            📦 数据库现有
+                          </div>
+                          <div style={{fontSize:11,fontWeight:600,lineHeight:1.3}}>{ex.name}{ex.variant_name?` · ${ex.variant_name}`:''}</div>
+                          <div style={{fontSize:10,color:C.slate,fontFamily:'monospace'}}>{ex.sku}</div>
+                          <div style={{fontSize:10,color:C.blue}}>
+                            {ex.platform} · 售价 {ex.price} · 成本 {ex.cost}
+                          </div>
+                        </div>
+                        {/* Incoming version */}
+                        <div style={{background:'#fff',borderRadius:6,padding:'6px 8px',
+                                     border:`1px solid ${C.orange}40`}}>
+                          <div style={{fontSize:9,color:C.orange,marginBottom:2,fontWeight:700}}>
+                            📥 Excel 新数据
+                          </div>
+                          <div style={{fontSize:11,fontWeight:600,lineHeight:1.3}}>{incoming?.name}{incoming?.variant_name?` · ${incoming.variant_name}`:''}</div>
+                          <div style={{fontSize:10,color:C.slate,fontFamily:'monospace'}}>{incoming?.sku}</div>
+                          <div style={{fontSize:10,color:C.orange}}>
+                            {incoming?.platform} · 售价 {incoming?.price} · 成本 {incoming?.cost}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* Action choice */}
+              <div style={{fontSize:12,fontWeight:700,color:C.navy,marginBottom:8}}>
+                对于重复 SKU，你想要：
+              </div>
+              <div style={{display:'flex',flexDirection:'column',gap:8}}>
+                <button onClick={()=>setDupAction('skip')}
+                  style={{padding:'12px 16px',borderRadius:10,border:`2px solid ${dupAction==='skip'?C.blue:C.slateLight+'40'}`,
+                    background:dupAction==='skip'?C.blue+'10':'#fff',cursor:'pointer',textAlign:'left'}}>
+                  <div style={{fontWeight:700,fontSize:13,color:dupAction==='skip'?C.blue:C.navy}}>
+                    ⏭ 跳过重复，只新增 {dupInfo.newCount} 个新产品
+                  </div>
+                  <div style={{fontSize:11,color:C.slate,marginTop:3}}>
+                    重复的 SKU 保持不变，只写入全新产品
+                  </div>
+                </button>
+                <button onClick={()=>setDupAction('overwrite')}
+                  style={{padding:'12px 16px',borderRadius:10,border:`2px solid ${dupAction==='overwrite'?C.orange:C.slateLight+'40'}`,
+                    background:dupAction==='overwrite'?C.orange+'10':'#fff',cursor:'pointer',textAlign:'left'}}>
+                  <div style={{fontWeight:700,fontSize:13,color:dupAction==='overwrite'?C.orange:C.navy}}>
+                    🔄 覆盖全部 {parsed.products.length} 个产品（包括重复的）
+                  </div>
+                  <div style={{fontSize:11,color:C.slate,marginTop:3}}>
+                    用 Excel 数据更新数据库里的产品名称、价格、图片等
+                    <br/>⚠️ 注意：会覆盖你手动修改过的成本
+                  </div>
+                </button>
+              </div>
             </div>
-            {parsed.preview.slice(0,10).map((p,i)=>(
-              <div key={i} style={{display:'flex',alignItems:'center',gap:10,
-                paddingBottom:8,marginBottom:8,
-                borderBottom:i<9?`1px solid ${C.cream}`:'none'}}>
-                {p.img
-                  ? <img src={p.img} onError={e=>e.target.style.display='none'}
-                      style={{width:36,height:36,borderRadius:7,objectFit:'cover',flexShrink:0}}/>
-                  : <div style={{width:36,height:36,borderRadius:7,background:C.cream,
-                                 display:'flex',alignItems:'center',justifyContent:'center',
-                                 fontSize:16,flexShrink:0}}>📦</div>
-                }
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{fontSize:12,fontWeight:p.isParent?700:500,
-                    overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',
-                    color:p.isParent?C.orange:C.navy}}>
-                    {p.isParent?'📁 ':''}{p.name}
-                  </div>
-                  <div style={{fontSize:10,color:C.slate,fontFamily:'monospace'}}>{p.sku}</div>
-                </div>
-                <div style={{textAlign:'right',flexShrink:0}}>
-                  <div style={{fontSize:12,fontWeight:700}}>
-                    {p.price>0?`${p.currency} ${p.price.toFixed(2)}`:'—'}
-                  </div>
-                  <div style={{fontSize:10,color:p.qty>0?C.green:C.slate}}>
-                    {p.qty>0?`${p.qty}件`:'无库存'}
-                  </div>
-                </div>
+          )}
+
+          {/* No duplicates */}
+          {dupInfo.duplicates.length===0 && (
+            <div style={{...S.card,border:`2px solid ${C.green}`,background:C.green+'08'}}>
+              <div style={{color:C.green,fontWeight:700,fontSize:14,marginBottom:4}}>
+                ✅ 没有重复 SKU
               </div>
-            ))}
-            {parsed.preview.length>10&&(
-              <div style={{textAlign:'center',fontSize:11,color:C.slate,padding:'6px'}}>
-                还有 {parsed.preview.length-10} 条未显示
+              <div style={{fontSize:12,color:C.slate}}>
+                全部 {parsed.products.length} 个产品都是新的，可以直接写入。
               </div>
-            )}
+            </div>
+          )}
+
+          {/* Notes */}
+          <div style={{...S.card,background:C.cream}}>
+            <div style={{fontSize:11,color:C.slate,lineHeight:1.9}}>
+              📌 成本暂用售价 50%，上传后请在产品页更新实际成本<br/>
+              📌 图片来自平台 CDN，产品下架后可能失效<br/>
+              📌 库存批次只针对有库存的产品写入
+            </div>
           </div>
 
           {/* Action buttons */}
           <div style={{display:'flex',gap:8}}>
-            <button onClick={reset} style={S.btn(C.slate,false)}>
-              ← 重新上传
-            </button>
-            <button onClick={handleUpload} disabled={!validation.valid}
-              style={{...S.btn(validation.valid?C.green:C.slateLight),
-                      flex:1,opacity:validation.valid?1:0.5}}>
-              ✅ 确认无误，写入数据库
+            <button onClick={reset} style={S.btn(C.slate,false)}>← 重新上传</button>
+            <button
+              onClick={handleUpload}
+              disabled={dupInfo.duplicates.length>0 && !dupAction}
+              style={{...S.btn(
+                dupInfo.duplicates.length===0||dupAction===undefined
+                  ? (dupAction||dupInfo.duplicates.length===0?C.green:C.slateLight)
+                  : dupAction?C.green:C.slateLight
+              ),flex:1,
+                opacity:dupInfo.duplicates.length===0||dupAction?1:0.4}}>
+              {dupAction==='overwrite'
+                ? `🔄 覆盖并写入 ${parsed.products.length} 个产品`
+                : dupAction==='skip'
+                ? `✅ 只写入 ${dupInfo.newCount} 个新产品`
+                : dupInfo.duplicates.length===0
+                ? `✅ 写入 ${parsed.products.length} 个产品`
+                : '请先选择重复处理方式'}
             </button>
           </div>
         </div>
       )}
 
-      {/* ── STEP 3: Uploading ─────────────────────────────────── */}
-      {step==='uploading'&&(
+      {/* ── UPLOADING ─────────────────────────────────────────── */}
+      {step==='uploading' && (
         <div style={{...S.card,textAlign:'center',padding:'40px 20px'}}>
           <div style={{fontSize:36,marginBottom:12}}>⏳</div>
           <div style={{fontSize:14,fontWeight:700,marginBottom:8}}>写入数据库中…</div>
-          <div style={{fontSize:12,color:C.slate}}>{progress}</div>
-          <div style={{marginTop:16,height:4,background:C.cream,borderRadius:2,overflow:'hidden'}}>
-            <div style={{height:'100%',background:C.orange,
-                         animation:'loading 1.5s ease-in-out infinite',width:'60%'}}/>
+          <div style={{fontSize:12,color:C.slate,marginBottom:16}}>{progress}</div>
+          <div style={{height:4,background:C.cream,borderRadius:2,overflow:'hidden'}}>
+            <div style={{height:'100%',background:C.orange,width:'60%',
+              animation:'ldbar 1.5s ease-in-out infinite'}}/>
           </div>
-          <style>{`@keyframes loading{0%{transform:translateX(-100%)}100%{transform:translateX(250%)}}`}</style>
+          <style>{`@keyframes ldbar{0%{transform:translateX(-100%)}100%{transform:translateX(250%)}}`}</style>
         </div>
       )}
 
-      {/* ── STEP 4: Done ──────────────────────────────────────── */}
-      {step==='done'&&uploadResult&&(
+      {/* ── DONE ──────────────────────────────────────────────── */}
+      {step==='done' && uploadRes && (
         <div>
           <div style={{...S.card,
-            background:uploadResult.errors.length===0?C.green+'12':C.yellow+'12',
-            border:`2px solid ${uploadResult.errors.length===0?C.green:C.yellow}`}}>
+            border:`2px solid ${uploadRes.errors.length===0?C.green:C.yellow}`,
+            background:uploadRes.errors.length===0?C.green+'08':C.yellow+'08'}}>
             <div style={{fontWeight:700,fontSize:15,marginBottom:12,
-              color:uploadResult.errors.length===0?C.green:C.yellow}}>
-              {uploadResult.errors.length===0?'🎉 上传成功！':'⚠️ 上传完成（有部分错误）'}
+              color:uploadRes.errors.length===0?C.green:C.yellow}}>
+              {uploadRes.errors.length===0?'🎉 上传成功！':'⚠️ 完成（有部分错误）'}
             </div>
             <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:12}}>
               {[
-                [uploadResult.inserted,'已写入产品',C.green],
-                [uploadResult.batchOk,'已写入库存批次',C.green],
-                [uploadResult.errors.length,'错误数',uploadResult.errors.length>0?C.red:C.green],
-                [totalStock,'总库存件数',C.navy],
+                [uploadRes.inserted||uploadRes.updated,'已写入产品',C.green],
+                [uploadRes.batchOk,                   '已写入库存批次',C.green],
+                [dupInfo?.duplicates.length||0,       '重复SKU',uploadRes.updated>0?C.orange:C.slate],
+                [uploadRes.errors.length,             '错误数',uploadRes.errors.length>0?C.red:C.green],
               ].map(([v,l,col])=>(
                 <div key={l} style={{background:'#fff',borderRadius:8,padding:'8px 10px'}}>
                   <div style={{fontSize:18,fontWeight:900,color:col}}>{v}</div>
@@ -609,13 +620,13 @@ export default function ImportPage({ shout, refetch }) {
                 </div>
               ))}
             </div>
-            {uploadResult.errors.map((e,i)=>(
+            {uploadRes.errors.slice(0,5).map((e,i)=>(
               <div key={i} style={{fontSize:11,color:C.red,marginBottom:4,
                 padding:'6px 10px',background:C.red+'10',borderRadius:6}}>❌ {e}</div>
             ))}
-            <div style={{fontSize:11,color:C.slate,marginTop:8}}>
-              ✅ 可以到「产品」页更新实际成本<br/>
-              ✅ 如需再导入其他平台，点下方重新开始
+            <div style={{fontSize:11,color:C.slate,marginTop:8,lineHeight:1.8}}>
+              ✅ 请到「产品」页更新实际成本<br/>
+              ✅ 库存已写入批次记录，可在扫码页查看
             </div>
           </div>
           <button onClick={reset} style={S.btn()}>📥 导入其他平台</button>
