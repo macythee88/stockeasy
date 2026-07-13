@@ -311,7 +311,8 @@ export default function ImportPage({ shout, refetch }) {
 
   // ── Step 2: Upload with chosen action ─────────────────────
   const handleUpload = async () => {
-    if (!parsed||!dupAction) return
+    if (!parsed) return
+    if (dupInfo && dupInfo.duplicates.length>0 && !dupAction) return
     setStep('uploading')
     try {
       const res = await doUpload(parsed.products, parsed.batches, dupAction, setProgress)
