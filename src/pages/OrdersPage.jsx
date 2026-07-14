@@ -146,71 +146,118 @@ const ORDER_SKU_PREFIX = {
 }
 const safeSkuPart = s => (s||'').toString().replace(/[^a-zA-Z0-9\-_]/g,'').slice(0,50)
 
+const safeParseDate = s => { const d = new Date(s); return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString() }
+
+// Lazada 真实状态 → 我们系统的三态（照真实导出文件核对过）
+// canceled 不在映射表里 —— 已取消的订单直接跳过，不导入，避免污染"未处理"清单
+const LAZADA_STATUS_MAP = { confirmed:'unprocessed', shipped:'processed', delivered:'processed', returned:'return' }
+
 function parseOrderXlsx(buffer, platform, products) {
   const wb  = XLSX.read(new Uint8Array(buffer), { type:'array' })
   const ws  = wb.Sheets[wb.SheetNames[0]]
   const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:'' })
+  const isLazada = platform.startsWith('Lazada')
 
-  // 表头探测：Shopee/Lazada 常见的订单号列名都试一遍
+  // 表头探测：Lazada 订单导出表头就在第一行，直接找 orderNumber/sellerSku
+  const headerKeys = isLazada
+    ? ['orderNumber','sellerSku']
+    : ['Order ID','order_id','orderNumber','Order Number','订单编号','订单号']
   let hIdx = -1
   for (let i=0;i<Math.min(raw.length,10);i++) {
-    if (raw[i].some(c=>['Order ID','order_id','orderNumber','Order Number','订单编号','订单号']
-        .some(k=>String(c).includes(k)))) { hIdx=i; break }
+    if (raw[i].some(c=>headerKeys.some(k=>String(c).includes(k)))) { hIdx=i; break }
   }
-  if (hIdx<0) return { orders:[], unmatched:[], headerFound:false }
+  if (hIdx<0) return { orders:[], unmatched:[], skipped:0, headerFound:false }
 
   const headers = raw[hIdx].map(h=>String(h).trim())
   const rows = []
   for (let i=hIdx+1;i<raw.length;i++) {
-    const r=raw[i]; if (!r[0]||String(r[0]).trim()==='') continue
-    const obj={}; headers.forEach((h,j)=>{ obj[h]=String(r[j]||'').trim() })
+    const r=raw[i]; if (r.every(c=>String(c||'').trim()==='')) continue
+    const obj={}; headers.forEach((h,j)=>{ obj[h]=String(r[j]!==undefined?r[j]:'').trim() })
     rows.push(obj)
   }
-  if (rows.length===0) return { orders:[], unmatched:[], headerFound:true }
+  if (rows.length===0) return { orders:[], unmatched:[], skipped:0, headerFound:true }
 
   // 按 sku 建索引，方便匹配现有产品（拿 default_location / 图片等）
   const bySku = new Map((products||[]).map(p=>[p.sku, p]))
   const prefix = ORDER_SKU_PREFIX[platform] || ''
   const unmatched = []
+  let skipped = 0
 
-  // 按订单号分组（同一订单可能有多行，每行一个 SKU）
-  const grouped = new Map()
+  // 按订单号分组；Lazada 导出是"一行=一件商品"粒度，同一订单同一 SKU 出现几行就是买了几件，
+  // 所以数量要靠"数行数"累加，不能直接读某一列
+  const grouped  = new Map()   // orderId -> order
+  const lineKeys = new Map()   // `${orderId}::${sku}` -> 该 SKU 在 order.items 里的下标
+
   rows.forEach(r=>{
-    const orderId = r['Order ID']||r['order_id']||r['orderNumber']||r['Order Number']||''
+    let orderId, rawSku, unitPaid, itemName, variantName, customerName, createdAt, rawStatus
+
+    if (isLazada) {
+      orderId      = r['orderNumber']||''
+      rawSku       = r['sellerSku']||''
+      unitPaid     = parseFloat(r['paidPrice']||r['unitPrice']||'0')||0
+      itemName     = r['itemName']||''
+      variantName  = r['variation']||''
+      customerName = r['customerName']||''
+      createdAt    = r['createTime']||''
+      rawStatus    = (r['status']||'').toLowerCase().trim()
+      if (rawStatus==='canceled'||rawStatus==='cancelled') { skipped++; return }
+    } else {
+      // Shopee 字段名暂未用真实导出文件核对过，保留原有猜测
+      orderId      = r['Order ID']||r['order_id']||r['orderNumber']||r['Order Number']||''
+      rawSku       = r['SKU Reference No.']||r['SellerSKU']||r['sellerSku']||r['SKU']||''
+      unitPaid     = parseFloat(r['Original Price']||r['Deal Price']||r['unitPrice']||'0')||0
+      itemName     = r['Product Name']||r['name']||''
+      variantName  = r['Variation Name']||r['variationName']||''
+      customerName = r['Buyer Username']||r['buyerName']||r['Recipient']||''
+      createdAt    = r['Order Creation Date']||r['createdAt']||''
+      rawStatus    = ''
+    }
     if (!orderId) return
-    const rawSku  = r['SKU Reference No.']||r['SellerSKU']||r['sellerSku']||r['SKU']||''
+
+    const status  = isLazada ? (LAZADA_STATUS_MAP[rawStatus]||'unprocessed') : 'unprocessed'
     const sku     = rawSku ? `${prefix}-${safeSkuPart(rawSku)}` : ''
     const product = sku ? bySku.get(sku) : null
     if (rawSku && !product) unmatched.push({ orderId, rawSku, sku })
 
     if (!grouped.has(orderId)) {
       grouped.set(orderId, {
-        id: orderId,
-        platform,
-        status: 'unprocessed',
-        customer: r['Buyer Username']||r['buyerName']||r['Recipient']||'',
-        total: 0,
-        created_at: r['Order Creation Date']||r['createdAt']||new Date().toISOString(),
+        id: orderId, platform, status,
+        customer: customerName, total: 0,
+        created_at: createdAt ? safeParseDate(createdAt) : new Date().toISOString(),
         items: [],
       })
     }
-    const order = grouped.get(orderId)
-    const qty       = parseInt(r['Quantity']||r['qty']||'1')||1
-    const unitPrice = parseFloat(r['Original Price']||r['Deal Price']||r['unitPrice']||'0')||0
-    order.items.push({
-      product_id:   product ? product.id : null,
-      sku,
-      name:         product ? product.name : (r['Product Name']||r['name']||rawSku),
-      variant_name: product ? product.variant_name : (r['Variation Name']||r['variationName']||''),
-      qty,
-      unit_price:   unitPrice,
-      // 顺手做「货架位置映射」：产品设了 default_location 就自动带进来，没设就先留空
-      location:     product ? (product.default_location||'') : '',
-    })
-    order.total += qty*unitPrice
+    const order   = grouped.get(orderId)
+    const lineKey = `${orderId}::${sku||rawSku}`
+    let idx = lineKeys.get(lineKey)
+    if (idx===undefined) {
+      idx = order.items.length
+      lineKeys.set(lineKey, idx)
+      order.items.push({
+        product_id:   product ? product.id : null,
+        sku,
+        name:         product ? product.name : (itemName||rawSku),
+        variant_name: product ? product.variant_name : variantName,
+        qty: 0, _paidSum: 0,
+        // 顺手做「货架位置映射」：产品设了 default_location 就自动带进来，没设就先留空
+        location:     product ? (product.default_location||'') : '',
+      })
+    }
+    const item = order.items[idx]
+    item.qty += 1
+    item._paidSum += unitPaid
+    order.total += unitPaid
   })
 
-  return { orders: Array.from(grouped.values()), unmatched, headerFound:true }
+  const orders = Array.from(grouped.values()).map(o=>({
+    ...o,
+    items: o.items.map(({_paidSum, qty, ...rest})=>({
+      ...rest, qty,
+      unit_price: qty>0 ? Math.round((_paidSum/qty)*100)/100 : 0,
+    })),
+  }))
+
+  return { orders, unmatched, skipped, headerFound:true }
 }
 
 // ── 写入 Supabase ───────────────────────────────────────────────
@@ -309,7 +356,10 @@ export default function OrdersPage({ orders, counts, loading, markProcessed, mar
       try {
         const result = parseOrderXlsx(ev.target.result, importPlat, products)
         if (!result.headerFound) { shout('无法识别表头，请确认这是订单导出文件',true); return }
-        if (result.orders.length===0) { shout('没有解析到任何订单行',true); return }
+        if (result.orders.length===0) {
+          shout(result.skipped>0 ? `全部 ${result.skipped} 行都是已取消订单，没有需要导入的内容` : '没有解析到任何订单行', true)
+          return
+        }
         setImportPreview(result)
       } catch(err) { shout('文件读取失败：'+err.message,true) }
     }
@@ -403,6 +453,10 @@ export default function OrdersPage({ orders, counts, loading, markProcessed, mar
                   {importPreview.unmatched.length>0&&(
                     <div><b style={{fontSize:18,color:C.yellow}}>{importPreview.unmatched.length}</b>
                       <span style={{fontSize:11,color:C.slate,marginLeft:4}}>行 SKU 未匹配</span></div>
+                  )}
+                  {importPreview.skipped>0&&(
+                    <div><b style={{fontSize:18,color:C.slateLight}}>{importPreview.skipped}</b>
+                      <span style={{fontSize:11,color:C.slate,marginLeft:4}}>行已取消（已跳过）</span></div>
                   )}
                 </div>
                 {importPreview.unmatched.length>0&&(
