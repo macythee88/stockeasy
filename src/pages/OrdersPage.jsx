@@ -4,6 +4,7 @@
 import { useState, useMemo, useRef } from 'react'
 import { C, S } from '../App'
 import * as XLSX from 'xlsx'
+import { supabase } from '../lib/supabase'
 
 const PLATFORMS = {
   'Shopee SG': { color:'#EE4D2D', bg:'#FFF0EE', icon:'🛍️' },
@@ -136,17 +137,28 @@ function PlatformBadge({ platform, size='sm' }) {
 }
 
 // ── Excel order import parser ─────────────────────────────────
-function parseShopeeOrderXlsx(buffer, platform) {
-  const wb    = XLSX.read(new Uint8Array(buffer), { type:'array' })
-  const ws    = wb.Sheets[wb.SheetNames[0]]
-  const raw   = XLSX.utils.sheet_to_json(ws, { header:1, defval:'' })
+// SKU 前缀规则跟 ImportPage.jsx 保持一致，确保能对上 products.sku
+// 例：Lazada MY "FullLeg-L" → "LZMY-FullLeg-L"
+const ORDER_SKU_PREFIX = {
+  'Shopee SG':'SHPSG', 'Shopee MY':'SHPMY',
+  'Lazada SG':'LZSG',  'Lazada MY':'LZMY',
+  'TikTok':'TTS',
+}
+const safeSkuPart = s => (s||'').toString().replace(/[^a-zA-Z0-9\-_]/g,'').slice(0,50)
+
+function parseOrderXlsx(buffer, platform, products) {
+  const wb  = XLSX.read(new Uint8Array(buffer), { type:'array' })
+  const ws  = wb.Sheets[wb.SheetNames[0]]
+  const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:'' })
+
+  // 表头探测：Shopee/Lazada 常见的订单号列名都试一遍
   let hIdx = -1
   for (let i=0;i<Math.min(raw.length,10);i++) {
-    if (raw[i].some(c=>String(c).includes('Order ID')||String(c).includes('order_id')||String(c).includes('orderNumber'))) {
-      hIdx=i; break
-    }
+    if (raw[i].some(c=>['Order ID','order_id','orderNumber','Order Number','订单编号','订单号']
+        .some(k=>String(c).includes(k)))) { hIdx=i; break }
   }
-  if (hIdx<0) return []
+  if (hIdx<0) return { orders:[], unmatched:[], headerFound:false }
+
   const headers = raw[hIdx].map(h=>String(h).trim())
   const rows = []
   for (let i=hIdx+1;i<raw.length;i++) {
@@ -154,23 +166,85 @@ function parseShopeeOrderXlsx(buffer, platform) {
     const obj={}; headers.forEach((h,j)=>{ obj[h]=String(r[j]||'').trim() })
     rows.push(obj)
   }
-  // Map to our order format
-  return rows.map(r=>({
-    id:         r['Order ID']||r['order_id']||r['orderNumber']||crypto.randomUUID().slice(0,8),
-    platform,
-    status:     'unprocessed',
-    customer:   r['Buyer Username']||r['buyerName']||'',
-    total:      parseFloat(r['Order Total']||r['total']||'0')||0,
-    created_at: r['Order Creation Date']||r['createdAt']||new Date().toISOString(),
-    items:[{
-      sku:          r['SKU Reference No.']||r['SellerSKU']||r['sellerSku']||'',
-      name:         r['Product Name']||r['name']||'',
-      variant_name: r['Variation Name']||r['variationName']||'',
-      qty:          parseInt(r['Quantity']||r['qty']||'1')||1,
-      unit_price:   parseFloat(r['Original Price']||r['unitPrice']||'0')||0,
-      location:     '',
-    }]
-  }))
+  if (rows.length===0) return { orders:[], unmatched:[], headerFound:true }
+
+  // 按 sku 建索引，方便匹配现有产品（拿 default_location / 图片等）
+  const bySku = new Map((products||[]).map(p=>[p.sku, p]))
+  const prefix = ORDER_SKU_PREFIX[platform] || ''
+  const unmatched = []
+
+  // 按订单号分组（同一订单可能有多行，每行一个 SKU）
+  const grouped = new Map()
+  rows.forEach(r=>{
+    const orderId = r['Order ID']||r['order_id']||r['orderNumber']||r['Order Number']||''
+    if (!orderId) return
+    const rawSku  = r['SKU Reference No.']||r['SellerSKU']||r['sellerSku']||r['SKU']||''
+    const sku     = rawSku ? `${prefix}-${safeSkuPart(rawSku)}` : ''
+    const product = sku ? bySku.get(sku) : null
+    if (rawSku && !product) unmatched.push({ orderId, rawSku, sku })
+
+    if (!grouped.has(orderId)) {
+      grouped.set(orderId, {
+        id: orderId,
+        platform,
+        status: 'unprocessed',
+        customer: r['Buyer Username']||r['buyerName']||r['Recipient']||'',
+        total: 0,
+        created_at: r['Order Creation Date']||r['createdAt']||new Date().toISOString(),
+        items: [],
+      })
+    }
+    const order = grouped.get(orderId)
+    const qty       = parseInt(r['Quantity']||r['qty']||'1')||1
+    const unitPrice = parseFloat(r['Original Price']||r['Deal Price']||r['unitPrice']||'0')||0
+    order.items.push({
+      product_id:   product ? product.id : null,
+      sku,
+      name:         product ? product.name : (r['Product Name']||r['name']||rawSku),
+      variant_name: product ? product.variant_name : (r['Variation Name']||r['variationName']||''),
+      qty,
+      unit_price:   unitPrice,
+      // 顺手做「货架位置映射」：产品设了 default_location 就自动带进来，没设就先留空
+      location:     product ? (product.default_location||'') : '',
+    })
+    order.total += qty*unitPrice
+  })
+
+  return { orders: Array.from(grouped.values()), unmatched, headerFound:true }
+}
+
+// ── 写入 Supabase ───────────────────────────────────────────────
+// orders 用 upsert + ignoreDuplicates：已存在的订单（可能已经被手动处理过状态）
+// 不会被覆盖；order_items 每次重新导入的订单会先删再插，避免同一张订单出现重复明细行
+async function writeOrdersToSupabase(orders) {
+  const CHUNK = 50
+  let insertedOrders = 0, insertedItems = 0
+  for (let i=0;i<orders.length;i+=CHUNK) {
+    const chunk = orders.slice(i,i+CHUNK)
+    const orderRows = chunk.map(o=>({
+      id:o.id, platform:o.platform, status:o.status,
+      customer:o.customer, total:Math.round((o.total||0)*100)/100,
+      created_at:o.created_at,
+    }))
+    const { error:e1 } = await supabase.from('orders')
+      .upsert(orderRows, { onConflict:'id', ignoreDuplicates:true })
+    if (e1) throw e1
+    insertedOrders += chunk.length
+
+    const ids = chunk.map(o=>o.id)
+    const { error:eDel } = await supabase.from('order_items').delete().in('order_id', ids)
+    if (eDel) throw eDel
+    const itemRows = chunk.flatMap(o=>o.items.map(it=>({
+      order_id:o.id, product_id:it.product_id, sku:it.sku, name:it.name,
+      variant_name:it.variant_name, qty:it.qty, unit_price:it.unit_price, location:it.location,
+    })))
+    if (itemRows.length>0) {
+      const { error:e2 } = await supabase.from('order_items').insert(itemRows)
+      if (e2) throw e2
+    }
+    insertedItems += itemRows.length
+  }
+  return { insertedOrders, insertedItems }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -184,6 +258,8 @@ export default function OrdersPage({ orders, counts, loading, markProcessed, mar
   const [returnModal,  setReturnModal]  = useState(null)
   const [returnReason, setReturnReason] = useState('')
   const [searchQ,      setSearchQ]      = useState('')
+  const [importPreview,setImportPreview]= useState(null) // {orders, unmatched, headerFound}
+  const [importBusy,   setImportBusy]   = useState(false)
   const fileRef = useRef()
 
   const pickList = useMemo(()=>buildPickList(orders),[orders])
@@ -224,19 +300,37 @@ export default function OrdersPage({ orders, counts, loading, markProcessed, mar
     shout(`✓ ${ids.length} 张订单已标记发货`)
   }
 
-  // ── Import from Excel ────────────────────────────────────────
+  // ── Import from Excel：先解析 + 匹配，预览确认后再写入 ──────────
   const handleImportFile = async (e) => {
     const file = e.target.files[0]; if (!file) return
+    setImportPreview(null)
     const reader = new FileReader()
-    reader.onload = async ev => {
+    reader.onload = ev => {
       try {
-        const parsed = parseShopeeOrderXlsx(ev.target.result, importPlat)
-        if (parsed.length===0) { shout('无法读取订单数据',true); return }
-        // TODO: import to Supabase via importOrders()
-        shout(`解析到 ${parsed.length} 张订单（功能开发中，请手动导入）`)
-      } catch(e) { shout('文件读取失败：'+e.message,true) }
+        const result = parseOrderXlsx(ev.target.result, importPlat, products)
+        if (!result.headerFound) { shout('无法识别表头，请确认这是订单导出文件',true); return }
+        if (result.orders.length===0) { shout('没有解析到任何订单行',true); return }
+        setImportPreview(result)
+      } catch(err) { shout('文件读取失败：'+err.message,true) }
     }
     reader.readAsArrayBuffer(file)
+    e.target.value = '' // 允许重复选择同一个文件
+  }
+
+  const handleConfirmImport = async () => {
+    if (!importPreview || importPreview.orders.length===0) return
+    setImportBusy(true)
+    try {
+      const { insertedOrders, insertedItems } = await writeOrdersToSupabase(importPreview.orders)
+      shout(`✓ 已导入 ${insertedOrders} 张订单，${insertedItems} 条明细`)
+      setImportPreview(null)
+      setShowImport(false)
+      fetchOrders && fetchOrders()
+    } catch(err) {
+      shout('写入失败：'+err.message,true)
+    } finally {
+      setImportBusy(false)
+    }
   }
 
   if (loading) return (
@@ -294,6 +388,40 @@ export default function OrdersPage({ orders, counts, loading, markProcessed, mar
             支持 Shopee / Lazada 订单导出文件（Excel/CSV）<br/>
             系统自动识别订单号、产品、数量、客户信息
           </div>
+
+          {/* ── 解析预览：确认无误再写入数据库 ────────────────── */}
+          {importPreview&&(()=>{
+            const itemCount = importPreview.orders.reduce((s,o)=>s+o.items.length,0)
+            const matched   = itemCount - importPreview.unmatched.length
+            return (
+              <div style={{marginTop:12,padding:12,background:C.cream,borderRadius:10}}>
+                <div style={{display:'flex',gap:16,marginBottom:8,flexWrap:'wrap'}}>
+                  <div><b style={{fontSize:18,color:C.navy}}>{importPreview.orders.length}</b>
+                    <span style={{fontSize:11,color:C.slate,marginLeft:4}}>张订单</span></div>
+                  <div><b style={{fontSize:18,color:C.green}}>{matched}</b>
+                    <span style={{fontSize:11,color:C.slate,marginLeft:4}}>行已匹配产品</span></div>
+                  {importPreview.unmatched.length>0&&(
+                    <div><b style={{fontSize:18,color:C.yellow}}>{importPreview.unmatched.length}</b>
+                      <span style={{fontSize:11,color:C.slate,marginLeft:4}}>行 SKU 未匹配</span></div>
+                  )}
+                </div>
+                {importPreview.unmatched.length>0&&(
+                  <div style={{fontSize:10,color:C.slateLight,marginBottom:8,lineHeight:1.6}}>
+                    未匹配的 SKU 仍会正常导入订单，只是暂时没有货架位置/图片，例如：{' '}
+                    {importPreview.unmatched.slice(0,5).map(u=>u.rawSku).join('、')}
+                    {importPreview.unmatched.length>5?' 等…':''}
+                  </div>
+                )}
+                <div style={{display:'flex',gap:8}}>
+                  <button onClick={()=>setImportPreview(null)} style={S.btn(C.slate,false)}>取消</button>
+                  <button onClick={handleConfirmImport} disabled={importBusy}
+                    style={{...S.btn(C.green,false),opacity:importBusy ? 0.6 : 1}}>
+                    {importBusy?'写入中…':`✅ 确认写入 ${importPreview.orders.length} 张订单`}
+                  </button>
+                </div>
+              </div>
+            )
+          })()}
         </div>
       )}
 
