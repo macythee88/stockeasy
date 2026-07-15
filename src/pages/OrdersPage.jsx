@@ -20,7 +20,9 @@ function buildPickList(orders) {
   orders.filter(o => o.status === 'unprocessed').forEach(order => {
     const items = order.order_items || []
     items.forEach(item => {
-      const key = `${item.sku}::${item.variant_name||''}`
+      // sku 为空时（该笔订单原始数据就没有 SKU，且商品名兜底匹配也没成功），
+      // 不能只靠 variant_name 当 key，否则不同商品会被误合并成同一行，改用商品名兜底
+      const key = item.sku ? `${item.sku}::${item.variant_name||''}` : `name:${item.name}::${item.variant_name||''}`
       if (!map[key]) map[key] = {
         sku: item.sku,
         name: item.name || item.products?.name || '',
@@ -145,6 +147,9 @@ const ORDER_SKU_PREFIX = {
   'TikTok':'TTS',
 }
 const safeSkuPart = s => (s||'').toString().replace(/[^a-zA-Z0-9\-_]/g,'').slice(0,50)
+// 跟 ImportPage.jsx 的 cleanName 保持完全一致 —— 产品导入时会去掉【Ready Stock】这类前缀，
+// 订单 Excel 里的 Product Name 还留着原始前缀，商品名兜底匹配前必须做同样的清洗，否则永远对不上
+const cleanName = n => (n||'').toString().replace(/【.*?】/g,'').trim().slice(0,120)
 
 const safeParseDate = s => { const d = new Date(s); return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString() }
 
@@ -233,7 +238,7 @@ function parseOrderXlsx(buffer, platform, products) {
 
     const sku = rawSku ? `${prefix}-${safeSkuPart(rawSku)}` : ''
     let product = sku ? bySku.get(sku) : null
-    if (!product) product = byNameVariant.get(`${itemName.trim()}::${variantName.trim()}`) || null
+    if (!product) product = byNameVariant.get(`${cleanName(itemName)}::${variantName.trim()}`) || null
     if (!product) unmatched.push({ orderId, rawSku: rawSku || `${itemName} / ${variantName}`, sku })
 
     if (!grouped.has(orderId)) {
@@ -359,9 +364,11 @@ export default function OrdersPage({ orders, counts, loading, markProcessed, mar
   const handleBatchProcess = async () => {
     const ids = Object.keys(checked).filter(id=>checked[id])
     if (!ids.length) { shout('请先勾选订单',true); return }
-    for (const id of ids) await markProcessed(id)
+    let ok = 0
+    for (const id of ids) { if (await markProcessed(id)) ok++ }
     setChecked({})
-    shout(`✓ ${ids.length} 张订单已标记发货`)
+    if (ok === ids.length) shout(`✓ ${ok} 张订单已标记发货`)
+    else shout(`⚠ ${ok}/${ids.length} 张成功，${ids.length-ok} 张失败，请检查网络或权限设置`, ok===0)
   }
 
   // ── Import from Excel：先解析 + 匹配，预览确认后再写入 ──────────
@@ -723,7 +730,10 @@ export default function OrdersPage({ orders, counts, loading, markProcessed, mar
               </button>
               {orderTab==='unprocessed'&&(
                 <>
-                  <button onClick={()=>{ markProcessed(order.id); shout(`#${order.id} 已发货 ✓`) }}
+                  <button onClick={async ()=>{
+                      const ok = await markProcessed(order.id)
+                      shout(ok?`#${order.id} 已发货 ✓`:'操作失败，请检查网络或权限设置', !ok)
+                    }}
                     style={S.btn(C.green,false,true)}>
                     ✅ 确认发货
                   </button>
