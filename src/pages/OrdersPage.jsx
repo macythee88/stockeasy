@@ -152,6 +152,14 @@ const safeParseDate = s => { const d = new Date(s); return isNaN(d.getTime()) ? 
 // canceled 不在映射表里 —— 已取消的订单直接跳过，不导入，避免污染"未处理"清单
 const LAZADA_STATUS_MAP = { confirmed:'unprocessed', shipped:'processed', delivered:'processed', returned:'return' }
 
+// Shopee「Order Status」映射：'to ship' 已用真实导出文件核对过；
+// 其余几个是 Shopee 后台常见状态名的合理猜测，遇到真实文件再核对修正
+const SHOPEE_STATUS_MAP = {
+  'to ship':'unprocessed', 'unpaid':'unprocessed',
+  'shipped':'processed', 'completed':'processed', 'to receive':'processed',
+  'to return / refund':'return', 'in cancellation':'return',
+}
+
 function parseOrderXlsx(buffer, platform, products) {
   const wb  = XLSX.read(new Uint8Array(buffer), { type:'array' })
   const ws  = wb.Sheets[wb.SheetNames[0]]
@@ -178,46 +186,55 @@ function parseOrderXlsx(buffer, platform, products) {
   if (rows.length===0) return { orders:[], unmatched:[], skipped:0, headerFound:true }
 
   // 按 sku 建索引，方便匹配现有产品（拿 default_location / 图片等）
+  // 兜底索引：有些卖家在 Shopee 后台没填 Seller SKU，订单导出里「SKU Reference No.」会是空的，
+  // 这种情况下退而求其次按「商品名 + 变体名」精确匹配
   const bySku = new Map((products||[]).map(p=>[p.sku, p]))
+  const byNameVariant = new Map((products||[]).map(p=>[`${(p.name||'').trim()}::${(p.variant_name||'').trim()}`, p]))
   const prefix = ORDER_SKU_PREFIX[platform] || ''
   const unmatched = []
   let skipped = 0
 
-  // 按订单号分组；Lazada 导出是"一行=一件商品"粒度，同一订单同一 SKU 出现几行就是买了几件，
-  // 所以数量要靠"数行数"累加，不能直接读某一列
+  // 按订单号分组；Lazada 导出是"一行=一件商品"粒度（没有数量列，靠数行数）；
+  // Shopee 导出每行自带 Quantity/Product Subtotal，直接读取即可
   const grouped  = new Map()   // orderId -> order
   const lineKeys = new Map()   // `${orderId}::${sku}` -> 该 SKU 在 order.items 里的下标
 
   rows.forEach(r=>{
-    let orderId, rawSku, unitPaid, itemName, variantName, customerName, createdAt, rawStatus
+    let orderId, rawSku, itemName, variantName, customerName, createdAt, rawStatus, rowQty, rowTotal
 
     if (isLazada) {
       orderId      = r['orderNumber']||''
       rawSku       = r['sellerSku']||''
-      unitPaid     = parseFloat(r['paidPrice']||r['unitPrice']||'0')||0
       itemName     = r['itemName']||''
       variantName  = r['variation']||''
       customerName = r['customerName']||''
       createdAt    = r['createTime']||''
       rawStatus    = (r['status']||'').toLowerCase().trim()
       if (rawStatus==='canceled'||rawStatus==='cancelled') { skipped++; return }
+      rowQty   = 1                                              // 一行=一件
+      rowTotal = parseFloat(r['paidPrice']||r['unitPrice']||'0')||0
     } else {
-      // Shopee 字段名暂未用真实导出文件核对过，保留原有猜测
-      orderId      = r['Order ID']||r['order_id']||r['orderNumber']||r['Order Number']||''
-      rawSku       = r['SKU Reference No.']||r['SellerSKU']||r['sellerSku']||r['SKU']||''
-      unitPaid     = parseFloat(r['Original Price']||r['Deal Price']||r['unitPrice']||'0')||0
-      itemName     = r['Product Name']||r['name']||''
-      variantName  = r['Variation Name']||r['variationName']||''
-      customerName = r['Buyer Username']||r['buyerName']||r['Recipient']||''
-      createdAt    = r['Order Creation Date']||r['createdAt']||''
-      rawStatus    = ''
+      orderId      = r['Order ID']||''
+      rawSku       = r['SKU Reference No.']||''
+      itemName     = r['Product Name']||''
+      variantName  = r['Variation Name']||''
+      customerName = r['Username (Buyer)']||r['Receiver Name']||''
+      createdAt    = r['Order Creation Date']||''
+      rawStatus    = (r['Order Status']||'').toLowerCase().trim()
+      if (rawStatus==='cancelled'||rawStatus==='canceled') { skipped++; return }
+      rowQty   = parseInt(r['Quantity']||'1')||1
+      rowTotal = parseFloat(r['Product Subtotal']||'0') || (parseFloat(r['Deal Price']||'0')||0)*rowQty
     }
     if (!orderId) return
 
-    const status  = isLazada ? (LAZADA_STATUS_MAP[rawStatus]||'unprocessed') : 'unprocessed'
-    const sku     = rawSku ? `${prefix}-${safeSkuPart(rawSku)}` : ''
-    const product = sku ? bySku.get(sku) : null
-    if (rawSku && !product) unmatched.push({ orderId, rawSku, sku })
+    const status = isLazada
+      ? (LAZADA_STATUS_MAP[rawStatus]||'unprocessed')
+      : (SHOPEE_STATUS_MAP[rawStatus]||'unprocessed')
+
+    const sku = rawSku ? `${prefix}-${safeSkuPart(rawSku)}` : ''
+    let product = sku ? bySku.get(sku) : null
+    if (!product) product = byNameVariant.get(`${itemName.trim()}::${variantName.trim()}`) || null
+    if (!product) unmatched.push({ orderId, rawSku: rawSku || `${itemName} / ${variantName}`, sku })
 
     if (!grouped.has(orderId)) {
       grouped.set(orderId, {
@@ -228,7 +245,7 @@ function parseOrderXlsx(buffer, platform, products) {
       })
     }
     const order   = grouped.get(orderId)
-    const lineKey = `${orderId}::${sku||rawSku}`
+    const lineKey = `${orderId}::${sku||`${itemName}::${variantName}`}`
     let idx = lineKeys.get(lineKey)
     if (idx===undefined) {
       idx = order.items.length
@@ -244,9 +261,9 @@ function parseOrderXlsx(buffer, platform, products) {
       })
     }
     const item = order.items[idx]
-    item.qty += 1
-    item._paidSum += unitPaid
-    order.total += unitPaid
+    item.qty += rowQty
+    item._paidSum += rowTotal
+    order.total += rowTotal
   })
 
   const orders = Array.from(grouped.values()).map(o=>({
