@@ -69,6 +69,10 @@ export function useOrders() {
     const today = new Date().toISOString().split('T')[0]
     for (const item of (order.order_items || [])) {
       if (!item.product_id || !item.qty) continue
+      // 用产品的真实进货成本，而不是订单的售价（item.unit_price 是客人付的钱，不是成本）
+      const { data: prod, error: costErr } = await supabase
+        .from('products').select('cost').eq('id', item.product_id).single()
+      if (costErr) console.error('restoreStock 读取产品成本失败:', costErr)
       const { error } = await supabase.from('batches').insert({
         id:            crypto.randomUUID(),
         product_id:    item.product_id,
@@ -76,7 +80,7 @@ export function useOrders() {
         qty:           item.qty,
         received_date: today,
         expiry_date:   null,
-        cost:          item.unit_price || 0,
+        cost:          prod?.cost ?? 0,
       })
       if (error) { console.error('restoreStock batch insert:', error); return false }
     }
@@ -87,24 +91,10 @@ export function useOrders() {
     return true
   }
 
-  // ── Import orders from platform Excel ─────────────────────
-  // (called from ImportPage after parsing)
-  const importOrders = async (orderRows) => {
-    let inserted = 0
-    for (const row of orderRows) {
-      const { error } = await supabase.from('orders').upsert({
-        id:         row.order_id,
-        platform:   row.platform,
-        status:     'unprocessed',
-        customer:   row.customer || '',
-        total:      row.total || 0,
-        created_at: row.created_at || new Date().toISOString(),
-      }, { onConflict:'id', ignoreDuplicates:true })
-      if (!error) inserted++
-    }
-    await fetchOrders()
-    return inserted
-  }
+  // 注：Excel 订单导入的实际逻辑现在直接写在 OrdersPage.jsx 里
+  // （parseOrderXlsx + writeOrdersToSupabase，处理 order_items、SKU/商品名匹配、状态映射等），
+  // 这里原本有一个更早期、不完整的 importOrders 占位函数（没处理 order_items，状态写死 unprocessed），
+  // 已经没有地方在调用，为了避免以后误用就整个移除了。
 
   // ── Counts ────────────────────────────────────────────────
   const counts = {
@@ -115,6 +105,6 @@ export function useOrders() {
 
   return {
     orders, loading, online, counts,
-    fetchOrders, markProcessed, markReturn, restoreStock, importOrders,
+    fetchOrders, markProcessed, markReturn, restoreStock,
   }
 }
