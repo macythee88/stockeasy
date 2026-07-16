@@ -5,7 +5,8 @@ import { uploadPhoto } from '../lib/supabase'
 
 const EMPTY = { name:'', variant_name:'', sku:'', barcode:'', cost:'', price:'',
                 shopee_sku:'', lazada_sku:'', min_stock:'30', reorder_days:'30',
-                has_expiry:false, platform:'Shopee MY', supplier_id:'', photo_url:'', parent_id:null }
+                has_expiry:false, platform:'Shopee MY', supplier_id:'', photo_url:'', parent_id:null,
+                default_location:'' }
 
 function genBarcode(sku) {
   const d = sku.replace(/[^a-zA-Z0-9]/g,'').split('').map(c=>c.charCodeAt(0)%10).join('').slice(0,11).padEnd(11,'0')
@@ -62,12 +63,60 @@ function ProductPhoto({ url, size=54, radius=10 }) {
   )
 }
 
+// ── 货架位置：点一下就能直接改，不用进完整编辑表单 ──────────────
+function LocationBadge({ product, upsertProduct, shout }) {
+  const [editing, setEditing] = useState(false)
+  const [val, setVal]         = useState(product.default_location || '')
+  const [saving, setSaving]   = useState(false)
+
+  const save = async () => {
+    const next = val.trim()
+    if (next === (product.default_location||'')) { setEditing(false); return }
+    setSaving(true)
+    try {
+      // 传整个产品对象（只改 default_location 这个字段），避免 upsert 把其他栏位清空
+      await upsertProduct({ ...product, default_location: next || null })
+      shout(next ? `货架位置已设为 ${next} ✓` : '货架位置已清空')
+    } catch(e) {
+      shout('保存失败：' + (e.message || '请检查网络'), true)
+      setVal(product.default_location || '')
+    }
+    setSaving(false); setEditing(false)
+  }
+
+  if (editing) return (
+    <input autoFocus value={val} disabled={saving}
+      onChange={e=>setVal(e.target.value)}
+      onBlur={save}
+      onKeyDown={e=>{
+        if (e.key==='Enter') save()
+        if (e.key==='Escape') { setVal(product.default_location||''); setEditing(false) }
+      }}
+      placeholder="如 A-01"
+      style={{width:58,fontSize:10,padding:'2px 5px',borderRadius:5,
+              border:`1px solid ${C.orange}`,fontFamily:'monospace',textAlign:'center'}}/>
+  )
+
+  return (
+    <button onClick={()=>setEditing(true)}
+      title="点击设置货架位置"
+      style={{background: product.default_location?C.navy:'#fff',
+              color: product.default_location?'#fff':C.slateLight,
+              border:`1px dashed ${product.default_location?C.navy:C.slateLight}80`,
+              borderRadius:6,padding:'2px 7px',fontSize:10,fontWeight:700,
+              cursor:'pointer',fontFamily:'monospace',whiteSpace:'nowrap'}}>
+      {saving ? '…' : (product.default_location ? `📍${product.default_location}` : '📍设置')}
+    </button>
+  )
+}
+
 export default function ProductsPage({ products, batches, suppliers, totalStock, upsertProduct, shout }) {
   const [showForm, setShowForm] = useState(false)
   const [form, setForm]         = useState(EMPTY)
   const [editId, setEditId]     = useState(null)
   const [uploading, setUploading] = useState(false)
   const [searchQ, setSearchQ]   = useState('')
+  const [onlyNoLocation, setOnlyNoLocation] = useState(false)
   const photoRef = useRef()
 
   const parentProducts = products.filter(p => !p.parent_id)
@@ -77,11 +126,17 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
     variantMap[p.parent_id].push(p)
   })
 
-  const filtered = parentProducts.filter(p =>
-    !searchQ ||
-    p.name.toLowerCase().includes(searchQ.toLowerCase()) ||
-    p.sku.toLowerCase().includes(searchQ.toLowerCase())
-  )
+  const filtered = parentProducts.filter(p => {
+    const matchQ = !searchQ ||
+      p.name.toLowerCase().includes(searchQ.toLowerCase()) ||
+      p.sku.toLowerCase().includes(searchQ.toLowerCase())
+    if (!matchQ) return false
+    if (onlyNoLocation) {
+      const group = [p, ...(variantMap[p.id]||[])]
+      if (!group.some(v => !v.default_location)) return false
+    }
+    return true
+  })
 
   const handlePhoto = async (e) => {
     const file = e.target.files[0]; if (!file) return
@@ -111,6 +166,7 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
       reorder_days: parseInt(form.reorder_days) || 30,
       supplier_id:  form.supplier_id  || null,
       parent_id:    form.parent_id    || null,
+      default_location: form.default_location?.trim() || null,
     }
     try {
       await upsertProduct(data)
@@ -124,11 +180,12 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
 
   const openEdit = (p) => {
     setForm({ ...EMPTY, ...p,
-      cost:         String(p.cost         || ''),
-      price:        String(p.price        || ''),
-      min_stock:    String(p.min_stock    || 30),
-      reorder_days: String(p.reorder_days || 30),
-      supplier_id:  p.supplier_id || '',
+      cost:             String(p.cost         || ''),
+      price:            String(p.price        || ''),
+      min_stock:        String(p.min_stock    || 30),
+      reorder_days:     String(p.reorder_days || 30),
+      supplier_id:      p.supplier_id || '',
+      default_location: p.default_location || '',
     })
     setEditId(p.id); setShowForm(true)
   }
@@ -177,6 +234,7 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
           ['产品名称 *',          'name',         'text'],
           ['变体名称（颜色/尺寸）', 'variant_name', 'text'],
           ['内部 SKU *',          'sku',          'text'],
+          ['货架位置（如 A-01）',  'default_location', 'text'],
           ['售价 RM',             'price',        'number'],
           ['进货成本 RM',         'cost',         'number'],
           ['Shopee SKU',          'shopee_sku',   'text'],
@@ -264,6 +322,24 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
           value={searchQ} onChange={e=>setSearchQ(e.target.value)}/>
       </div>
 
+      {(() => {
+        const missing = products.filter(v => !v.default_location).length
+        return missing>0 && (
+          <div onClick={()=>setOnlyNoLocation(v=>!v)}
+            style={{display:'flex',alignItems:'center',justifyContent:'space-between',
+                   background: onlyNoLocation ? C.orange+'20' : C.navy+'08',
+                   border:`1px solid ${onlyNoLocation?C.orange:C.navy}30`,
+                   borderRadius:10,padding:'9px 12px',marginBottom:12,cursor:'pointer'}}>
+            <span style={{fontSize:12,fontWeight:600,color:C.navy}}>
+              📍 还有 <b style={{color:C.orange}}>{missing}</b> 个产品/变体没设货架位置
+            </span>
+            <span style={{fontSize:11,color:C.slate,fontWeight:700}}>
+              {onlyNoLocation ? '✓ 只看这些' : '点击只看这些 →'}
+            </span>
+          </div>
+        )
+      })()}
+
       {/* Shopee image notice */}
       <div style={{background:C.yellow+'18',border:`1px solid ${C.yellow}40`,borderRadius:10,
                    padding:'10px 12px',marginBottom:12,fontSize:11,color:C.navy,lineHeight:1.6}}>
@@ -308,6 +384,7 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
                   </div>
                   <div style={{display:'flex',gap:8,alignItems:'center'}}>
                     <StatusBadge stock={stock} min={v.min_stock}/>
+                    <LocationBadge product={v} upsertProduct={upsertProduct} shout={shout}/>
                     <span style={{fontSize:15,fontWeight:900,
                                  color:stock<v.min_stock?C.red:C.navy}}>{stock}</span>
                     <button onClick={()=>openEdit(v)}
@@ -322,7 +399,8 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
 
             <button onClick={()=>{
               setForm({...EMPTY,name:p.name,parent_id:p.id,
-                      photo_url:p.photo_url,supplier_id:p.supplier_id||''})
+                      photo_url:p.photo_url,supplier_id:p.supplier_id||'',
+                      default_location:p.default_location||''})
               setEditId(null); setShowForm(true)
             }} style={{...S.btn('#3498DB',true,true),marginTop:4}}>
               + 新增变体
