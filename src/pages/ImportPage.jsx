@@ -184,16 +184,21 @@ async function checkDuplicates(products) {
 }
 
 // ── Upload to Supabase ────────────────────────────────────────
-async function doUpload(products, batches, dupAction, onProgress) {
-  // dupAction: 'skip' | 'overwrite'
+// dupAction: 'skip'（跳过重复，只新增全新产品，重复产品的资料和库存都不动）
+//          | 'overwrite'（覆盖重复产品的资料，但库存不动——不会重复累加库存）
+//          | 'overwrite_stock'（覆盖资料 + 库存数量校正为 Excel 上的数字，
+//                                会先清空该产品的旧库存批次，再按 Excel 数字建一笔新的）
+// 全新产品（不管选哪个模式）都会正常写入库存批次，因为它们没有旧数据需要顾虑
+async function doUpload(products, batches, dupAction, dupSkus, onProgress) {
   const CHUNK = 50
-  let inserted=0, skipped=0, updated=0, batchOk=0
+  let inserted=0, updated=0, batchOk=0, stockCorrected=0
   const errors=[]
+  const dupSkuSet = new Set(dupSkus||[])
 
   onProgress('上传产品中…')
 
-  if (dupAction === 'overwrite') {
-    // upsert all
+  if (dupAction === 'overwrite' || dupAction === 'overwrite_stock') {
+    // upsert all（覆盖重复产品的资料）
     for (let i=0; i<products.length; i+=CHUNK) {
       const chunk = products.slice(i,i+CHUNK)
       onProgress(`覆盖产品 ${i+1}–${Math.min(i+CHUNK,products.length)} / ${products.length}`)
@@ -207,14 +212,14 @@ async function doUpload(products, batches, dupAction, onProgress) {
     for (let i=0; i<products.length; i+=CHUNK) {
       const chunk = products.slice(i,i+CHUNK)
       onProgress(`新增产品 ${i+1}–${Math.min(i+CHUNK,products.length)} / ${products.length}`)
-      const { error, data } = await supabase.from('products')
+      const { error } = await supabase.from('products')
         .upsert(chunk, { onConflict:'sku', ignoreDuplicates:true })
       if (error) errors.push(error.message)
       else inserted += chunk.length
     }
   }
 
-  if (errors.length>0) return { inserted, updated, skipped, batchOk, errors }
+  if (errors.length>0) return { inserted, updated, skipped:0, batchOk, stockCorrected, errors }
 
   // Re-fetch inserted IDs by SKU to correctly link batches
   onProgress('验证产品 ID，准备写入库存…')
@@ -233,18 +238,39 @@ async function doUpload(products, batches, dupAction, onProgress) {
   const remapped = batches.map(b => {
     const p = products.find(x=>x.id===b.product_id)
     const dbId = p ? skuToId[p.sku] : null
-    return dbId ? {...b, product_id:dbId} : null
+    return dbId ? {...b, product_id:dbId, _sku:p.sku} : null
   }).filter(Boolean)
 
-  for (let i=0; i<remapped.length; i+=CHUNK) {
-    const chunk = remapped.slice(i,i+CHUNK)
-    onProgress(`写入库存批次 ${i+1}–${Math.min(i+CHUNK,remapped.length)} / ${remapped.length}`)
+  // 重复 SKU 对应的产品 id（用来判断哪些批次属于"已存在的产品"）
+  const dupProductIds = new Set(
+    remapped.filter(b => dupSkuSet.has(b._sku)).map(b => b.product_id)
+  )
+
+  if (dupAction === 'overwrite_stock' && dupProductIds.size > 0) {
+    onProgress('清空重复产品的旧库存批次，准备用 Excel 数字校正…')
+    const { error } = await supabase.from('batches').delete().in('product_id', [...dupProductIds])
+    if (error) errors.push('清空旧批次失败：'+error.message)
+    stockCorrected = dupProductIds.size
+  }
+
+  // 决定哪些批次真的要插入：
+  // - overwrite_stock：全部批次都插（新产品 + 已清空、要校正的重复产品）
+  // - overwrite / skip：只插"全新产品"的批次，重复产品的库存维持原样，不重复累加
+  const batchesToInsert = (dupAction === 'overwrite_stock')
+    ? remapped
+    : remapped.filter(b => !dupProductIds.has(b.product_id))
+
+  const cleanBatches = batchesToInsert.map(({_sku, ...rest}) => rest)
+
+  for (let i=0; i<cleanBatches.length; i+=CHUNK) {
+    const chunk = cleanBatches.slice(i,i+CHUNK)
+    onProgress(`写入库存批次 ${i+1}–${Math.min(i+CHUNK,cleanBatches.length)} / ${cleanBatches.length}`)
     const { error } = await supabase.from('batches').insert(chunk)
     if (error) errors.push('批次错误：'+error.message)
     else batchOk += chunk.length
   }
 
-  return { inserted, updated, skipped, batchOk, errors }
+  return { inserted, updated, skipped:0, batchOk, stockCorrected, errors }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -256,7 +282,7 @@ export default function ImportPage({ shout, refetch }) {
   const [step,      setStep]      = useState('upload')
   const [parsed,    setParsed]    = useState(null)       // {products, batches, currency}
   const [dupInfo,   setDupInfo]   = useState(null)       // {duplicates[], newCount}
-  const [dupAction, setDupAction] = useState(null)       // 'skip'|'overwrite'
+  const [dupAction, setDupAction] = useState(null)       // 'skip'|'overwrite'|'overwrite_stock'
   const [progress,  setProgress]  = useState('')
   const [uploadRes, setUploadRes] = useState(null)
   const [logs,      setLogs]      = useState([])
@@ -315,7 +341,8 @@ export default function ImportPage({ shout, refetch }) {
     if (dupInfo && dupInfo.duplicates.length>0 && !dupAction) return
     setStep('uploading')
     try {
-      const res = await doUpload(parsed.products, parsed.batches, dupAction, setProgress)
+      const dupSkus = (dupInfo?.duplicates||[]).map(d=>d.sku)
+      const res = await doUpload(parsed.products, parsed.batches, dupAction, dupSkus, setProgress)
       setUploadRes(res)
       setStep('done')
       if (res.errors.length===0) {
@@ -528,18 +555,29 @@ export default function ImportPage({ shout, refetch }) {
                     ⏭ 跳过重复，只新增 {dupInfo.newCount} 个新产品
                   </div>
                   <div style={{fontSize:11,color:C.slate,marginTop:3}}>
-                    重复的 SKU 保持不变，只写入全新产品
+                    重复的 SKU 完全不动（资料、库存都保持原样）
                   </div>
                 </button>
                 <button onClick={()=>setDupAction('overwrite')}
                   style={{padding:'12px 16px',borderRadius:10,border:`2px solid ${dupAction==='overwrite'?C.orange:C.slateLight+'40'}`,
                     background:dupAction==='overwrite'?C.orange+'10':'#fff',cursor:'pointer',textAlign:'left'}}>
                   <div style={{fontWeight:700,fontSize:13,color:dupAction==='overwrite'?C.orange:C.navy}}>
-                    🔄 覆盖全部 {parsed.products.length} 个产品（包括重复的）
+                    🔄 只覆盖产品资料 {parsed.products.length} 个产品（库存不动）
                   </div>
                   <div style={{fontSize:11,color:C.slate,marginTop:3}}>
-                    用 Excel 数据更新数据库里的产品名称、价格、图片等
+                    更新名称、价格、图片等，<b>库存数量维持原样、不会重复累加</b>
                     <br/>⚠️ 注意：会覆盖你手动修改过的成本
+                  </div>
+                </button>
+                <button onClick={()=>setDupAction('overwrite_stock')}
+                  style={{padding:'12px 16px',borderRadius:10,border:`2px solid ${dupAction==='overwrite_stock'?C.red:C.slateLight+'40'}`,
+                    background:dupAction==='overwrite_stock'?C.red+'10':'#fff',cursor:'pointer',textAlign:'left'}}>
+                  <div style={{fontWeight:700,fontSize:13,color:dupAction==='overwrite_stock'?C.red:C.navy}}>
+                    🔁 完全覆盖（含库存数量校正）
+                  </div>
+                  <div style={{fontSize:11,color:C.slate,marginTop:3}}>
+                    覆盖产品资料 + <b>把库存数量校正成 Excel 上的数字</b>（先清空旧库存批次，再按 Excel 重建）
+                    <br/>⚠️ 适合"以平台后台数据为准"的情况；如果这段时间在 StockEasy 里手动调整过库存，会被 Excel 的数字取代
                   </div>
                 </button>
               </div>
@@ -579,8 +617,10 @@ export default function ImportPage({ shout, refetch }) {
                   : dupAction?C.green:C.slateLight
               ),flex:1,
                 opacity:dupInfo.duplicates.length===0||dupAction?1:0.4}}>
-              {dupAction==='overwrite'
-                ? `🔄 覆盖并写入 ${parsed.products.length} 个产品`
+              {dupAction==='overwrite_stock'
+                ? `🔁 完全覆盖并校正库存（${parsed.products.length} 个产品）`
+                : dupAction==='overwrite'
+                ? `🔄 覆盖资料并写入 ${parsed.products.length} 个产品`
                 : dupAction==='skip'
                 ? `✅ 只写入 ${dupInfo.newCount} 个新产品`
                 : dupInfo.duplicates.length===0
@@ -628,6 +668,11 @@ export default function ImportPage({ shout, refetch }) {
                 </div>
               ))}
             </div>
+            {uploadRes.stockCorrected>0 && (
+              <div style={{fontSize:11,color:C.red,marginBottom:8}}>
+                🔁 {uploadRes.stockCorrected} 个重复产品的库存已用 Excel 数字校正（旧批次已清空重建）
+              </div>
+            )}
             {uploadRes.errors.slice(0,5).map((e,i)=>(
               <div key={i} style={{fontSize:11,color:C.red,marginBottom:4,
                 padding:'6px 10px',background:C.red+'10',borderRadius:6}}>❌ {e}</div>
@@ -641,5 +686,3 @@ export default function ImportPage({ shout, refetch }) {
         </div>
       )}
     </div>
-  )
-}
