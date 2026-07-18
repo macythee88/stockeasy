@@ -79,6 +79,7 @@ const TABS = [
   { id:'purchase',  icon:'📦', label:'入货'  },
   { id:'products',  icon:'🗂',  label:'产品' },
   { id:'import',    icon:'📥', label:'导入'  },
+  { id:'report',    icon:'📈', label:'报表'  },
 ]
 
 export default function App() {
@@ -161,6 +162,7 @@ export default function App() {
                 {tab==='purchase'  && <PurchasePage {...pageProps} />}
                 {tab==='products'  && <ProductsPage {...pageProps} />}
                 {tab==='import'    && <ImportPage   shout={shout}  refetch={data.refetch} />}
+                {tab==='report'    && <ReportPage   {...pageProps} orders={orders.orders} />}
               </>}
         </div>
 
