@@ -139,7 +139,16 @@ export default function ContentStudioPage({ shout }) {
       const { data, error } = await supabase.functions.invoke('generate-copy', {
         body: { image: base64, mediaType: file.type||'image/jpeg', context, useSearch },
       })
-      if (error) throw error
+      if (error) {
+        // supabase-js 遇到非 2xx 响应时，error.message 只会给一句很笼统的提示，
+        // 真正的错误原因要自己从 error.context（原始 Response）里读出来
+        let detail = error.message
+        try {
+          const body = await error.context.json()
+          if (body?.error) detail = body.error
+        } catch {}
+        throw new Error(detail)
+      }
       if (data?.error) throw new Error(data.error)
       const copy = {
         tagline: data.tagline || '主标语',
