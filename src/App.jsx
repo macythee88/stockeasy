@@ -70,6 +70,7 @@ import ReportPage   from './pages/ReportPage.jsx'
 import ProductsPage from './pages/ProductsPage.jsx'
 import ImportPage   from './pages/ImportPage.jsx'
 import OrdersPage   from './pages/OrdersPage.jsx'
+import ContentStudioPage from './pages/ContentStudioPage.jsx'
 
 // ── Tabs ──────────────────────────────────────────────────────
 const TABS = [
@@ -80,6 +81,7 @@ const TABS = [
   { id:'products',  icon:'🗂',  label:'产品' },
   { id:'import',    icon:'📥', label:'导入'  },
   { id:'report',    icon:'📈', label:'报表'  },
+  { id:'studio',    icon:'🎨', label:'作图'  },
 ]
 
 export default function App() {
@@ -163,6 +165,7 @@ export default function App() {
                 {tab==='products'  && <ProductsPage {...pageProps} />}
                 {tab==='import'    && <ImportPage   shout={shout}  refetch={data.refetch} />}
                 {tab==='report'    && <ReportPage   {...pageProps} orders={orders.orders} />}
+                {tab==='studio'    && <ContentStudioPage shout={shout} />}
               </>}
         </div>
 
