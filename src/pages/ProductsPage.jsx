@@ -1,12 +1,12 @@
 // src/pages/ProductsPage.jsx
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { C, S, StatusBadge } from '../App'
-import { uploadPhoto } from '../lib/supabase'
+import { uploadPhoto, supabase } from '../lib/supabase'
 
 const EMPTY = { name:'', variant_name:'', sku:'', barcode:'', cost:'', price:'',
                 shopee_sku:'', lazada_sku:'', min_stock:'30', reorder_days:'30',
                 has_expiry:false, platform:'Shopee MY', supplier_id:'', photo_url:'', parent_id:null,
-                default_location:'' }
+                default_location:'', shop_id:'' }
 
 function genBarcode(sku) {
   const d = sku.replace(/[^a-zA-Z0-9]/g,'').split('').map(c=>c.charCodeAt(0)%10).join('').slice(0,11).padEnd(11,'0')
@@ -117,7 +117,16 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
   const [uploading, setUploading] = useState(false)
   const [searchQ, setSearchQ]   = useState('')
   const [onlyNoLocation, setOnlyNoLocation] = useState(false)
+  const [shops, setShops]       = useState([])
+  const [shopFilter, setShopFilter] = useState('all')
   const photoRef = useRef()
+
+  useEffect(() => {
+    supabase.from('shops').select('id,platform,shop_code,shop_name').order('platform').order('shop_code')
+      .then(({ data, error }) => { if (!error) setShops(data||[]) })
+  }, [])
+  const shopById = Object.fromEntries(shops.map(s=>[s.id, s]))
+  const shopLabel = s => s ? (s.shop_name || `${s.platform} 店铺${s.shop_code}`) : null
 
   const parentProducts = products.filter(p => !p.parent_id)
   const variantMap = {}
@@ -131,6 +140,7 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
       p.name.toLowerCase().includes(searchQ.toLowerCase()) ||
       p.sku.toLowerCase().includes(searchQ.toLowerCase())
     if (!matchQ) return false
+    if (shopFilter!=='all' && p.shop_id!==shopFilter) return false
     if (onlyNoLocation) {
       const group = [p, ...(variantMap[p.id]||[])]
       if (!group.some(v => !v.default_location)) return false
@@ -167,6 +177,7 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
       supplier_id:  form.supplier_id  || null,
       parent_id:    form.parent_id    || null,
       default_location: form.default_location?.trim() || null,
+      shop_id:      form.shop_id || null,
     }
     try {
       await upsertProduct(data)
@@ -186,6 +197,7 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
       reorder_days:     String(p.reorder_days || 30),
       supplier_id:      p.supplier_id || '',
       default_location: p.default_location || '',
+      shop_id:          p.shop_id || '',
     })
     setEditId(p.id); setShowForm(true)
   }
@@ -299,10 +311,24 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
         <div style={{marginBottom:16}}>
           <label style={S.lbl}>主要平台</label>
           <select style={S.inp} value={form.platform}
-            onChange={e=>setForm(f=>({...f,platform:e.target.value}))}>
+            onChange={e=>setForm(f=>({...f,platform:e.target.value,shop_id:''}))}>
             {['Shopee MY','Shopee SG','Lazada MY','Lazada SG','多平台'].map(p=><option key={p}>{p}</option>)}
           </select>
         </div>
+
+        {/* Shop */}
+        {shops.filter(s=>s.platform===form.platform).length>0 && (
+          <div style={{marginBottom:16}}>
+            <label style={S.lbl}>店铺账号</label>
+            <select style={S.inp} value={form.shop_id||''}
+              onChange={e=>setForm(f=>({...f,shop_id:e.target.value}))}>
+              <option value="">— 未指定 —</option>
+              {shops.filter(s=>s.platform===form.platform).map(s=>
+                <option key={s.id} value={s.id}>{s.shop_name || `店铺${s.shop_code}`}</option>
+              )}
+            </select>
+          </div>
+        )}
 
         <button onClick={handleSave} style={S.btn()}>
           💾 {editId ? '保存更改' : '新增产品'}
@@ -321,6 +347,17 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
         <input style={S.inp} placeholder="搜索产品名或 SKU…"
           value={searchQ} onChange={e=>setSearchQ(e.target.value)}/>
       </div>
+
+      {shops.length>0 && (
+        <div style={{marginBottom:12}}>
+          <select style={S.inp} value={shopFilter} onChange={e=>setShopFilter(e.target.value)}>
+            <option value="all">🏪 全部店铺</option>
+            {shops.map(s=>(
+              <option key={s.id} value={s.id}>{s.platform} · {s.shop_name || `店铺${s.shop_code}`}</option>
+            ))}
+          </select>
+        </div>
+      )}
 
       {(() => {
         const missing = products.filter(v => !v.default_location).length
@@ -362,7 +399,15 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
             <div style={{display:'flex',gap:10,alignItems:'center',marginBottom:10}}>
               <ProductPhoto url={p.photo_url} size={54} radius={10}/>
               <div style={{flex:1}}>
-                <div style={{fontWeight:700,fontSize:14}}>{p.name}</div>
+                <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
+                  <div style={{fontWeight:700,fontSize:14}}>{p.name}</div>
+                  {shopById[p.shop_id] && (
+                    <span style={{fontSize:9,fontWeight:700,color:C.navy,background:C.cream,
+                                 border:`1px solid ${C.navy}30`,borderRadius:5,padding:'1px 6px'}}>
+                      🏪 {shopLabel(shopById[p.shop_id])}
+                    </span>
+                  )}
+                </div>
                 <div style={{fontSize:11,color:C.slate,marginTop:2}}>
                   {variants.length>0 ? `${variants.length+1} 个变体` : p.variant_name||'无变体'}
                 </div>
@@ -400,7 +445,8 @@ export default function ProductsPage({ products, batches, suppliers, totalStock,
             <button onClick={()=>{
               setForm({...EMPTY,name:p.name,parent_id:p.id,
                       photo_url:p.photo_url,supplier_id:p.supplier_id||'',
-                      default_location:p.default_location||''})
+                      default_location:p.default_location||'',
+                      platform:p.platform||EMPTY.platform,shop_id:p.shop_id||''})
               setEditId(null); setShowForm(true)
             }} style={{...S.btn('#3498DB',true,true),marginTop:4}}>
               + 新增变体

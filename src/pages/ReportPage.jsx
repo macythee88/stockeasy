@@ -16,7 +16,15 @@ function Pill({active,onClick,children,color=C.orange}){
 export default function ReportPage({ products, batches, purchaseOrders, totalStock, orders=[], shout }) {
   const [period,     setPeriod]     = useState('30')
   const [platFilter, setPlatFilter] = useState('全部')
+  const [shopFilter, setShopFilter] = useState('all')
   const [sortBy,     setSortBy]     = useState('value') // value | stock | expiry_risk
+  const [shops,      setShops]      = useState([])
+
+  useEffect(() => {
+    supabase.from('shops').select('id,platform,shop_code,shop_name').order('platform').order('shop_code')
+      .then(({ data, error }) => { if (!error) setShops(data||[]) })
+  }, [])
+  const shopsForPlat = shops.filter(s => platFilter==='全部' || s.platform===platFilter)
 
   // ── 平台费率（净利润计算要用）─────────────────────────────
   const DEFAULT_RULE = { commission_pct:0, payment_fee_pct:0, fixed_shipping_fee:0 }
@@ -59,11 +67,13 @@ export default function ReportPage({ products, batches, purchaseOrders, totalSto
   const today  = new Date()
   const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - parseInt(period))
 
-  // Filter products by platform
-  const filteredProducts = useMemo(() =>
-    platFilter === '全部' ? products
+  // Filter products by platform + shop
+  const filteredProducts = useMemo(() => {
+    let list = platFilter === '全部' ? products
       : products.filter(p => (p.platform||'').includes(platFilter.replace('全部','')))
-  , [products, platFilter])
+    if (shopFilter !== 'all') list = list.filter(p => p.shop_id === shopFilter)
+    return list
+  }, [products, platFilter, shopFilter])
 
   // Inventory value by currency
   const sgdProducts = filteredProducts.filter(p => currency(p.platform)==='SGD')
@@ -114,6 +124,7 @@ export default function ReportPage({ products, batches, purchaseOrders, totalSto
       if (!o.created_at || new Date(o.created_at) < cutoff) return false
       if (o.status === 'return') return false   // 退货不计入营收
       if (platFilter !== '全部' && !(o.platform||'').includes(platFilter)) return false
+      if (shopFilter !== 'all' && o.shop_id !== shopFilter) return false
       return true
     })
 
@@ -135,7 +146,7 @@ export default function ReportPage({ products, batches, purchaseOrders, totalSto
     })
 
     return byCur
-  }, [orders, cutoff, platFilter, feeRules, productById])
+  }, [orders, cutoff, platFilter, shopFilter, feeRules, productById])
 
   const maxVal = Math.max(...productStats.map(p=>p.value),1)
 
@@ -152,9 +163,22 @@ export default function ReportPage({ products, batches, purchaseOrders, totalSto
         <div style={{marginBottom:10}}>
           <div style={{fontSize:11,fontWeight:700,color:C.slate,marginBottom:6}}>平台筛选</div>
           <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
-            {PLATFORMS.map(p=><Pill key={p} active={platFilter===p} onClick={()=>setPlatFilter(p)} color={C.blue}>{p}</Pill>)}
+            {PLATFORMS.map(p=><Pill key={p} active={platFilter===p} onClick={()=>{setPlatFilter(p);setShopFilter('all')}} color={C.blue}>{p}</Pill>)}
           </div>
         </div>
+        {shopsForPlat.length>0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:C.slate,marginBottom:6}}>店铺筛选</div>
+            <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
+              <Pill active={shopFilter==='all'} onClick={()=>setShopFilter('all')} color={C.navy}>全部店铺</Pill>
+              {shopsForPlat.map(s=>(
+                <Pill key={s.id} active={shopFilter===s.id} onClick={()=>setShopFilter(s.id)} color={C.navy}>
+                  🏪 {s.shop_name || `${s.platform.includes('MY')?'MY':'SG'} 店${s.shop_code}`}
+                </Pill>
+              ))}
+            </div>
+          </div>
+        )}
         <div>
           <div style={{fontSize:11,fontWeight:700,color:C.slate,marginBottom:6}}>排序</div>
           <div style={{display:'flex',gap:5}}>

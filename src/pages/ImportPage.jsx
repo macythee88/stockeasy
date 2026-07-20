@@ -1,5 +1,5 @@
 // src/pages/ImportPage.jsx
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { C, S } from '../App'
 import * as XLSX from 'xlsx'
 import { supabase } from '../lib/supabase'
@@ -66,12 +66,18 @@ function readXlsx(file) {
 }
 
 // ── Parse products from Excel rows ────────────────────────────
-function parseProducts(salesRows, mediaRows, platform) {
-  const isShopee = platform.startsWith('Shopee')
-  const isMY     = platform.includes('MY')
-  const currency = isMY ? 'RM' : 'SGD'
-  const prefix   = isShopee ? (isMY?'SHPMY':'SHPSG') : (isMY?'LZMY':'LZSG')
-  const batchTag = `LOT-${prefix}-IMPORT`
+function parseProducts(salesRows, mediaRows, platform, shop) {
+  const isShopee   = platform.startsWith('Shopee')
+  const isMY       = platform.includes('MY')
+  const currency   = isMY ? 'RM' : 'SGD'
+  // 前缀带上店铺编号，避免同平台不同店铺的 Seller SKU 撞在一起
+  // 「店铺1」当作默认店铺、不加后缀，这样能跟多店铺功能上线之前导入的旧数据对上号；
+  // 店铺2、3…才会真的加数字后缀，例：Lazada MY 店铺2 → "LZMY2-FullLeg-L"
+  const platPrefix = isShopee ? (isMY?'SHPMY':'SHPSG') : (isMY?'LZMY':'LZSG')
+  const shopSuffix  = (shop?.shop_code && shop.shop_code!=='1') ? shop.shop_code : ''
+  const prefix      = `${platPrefix}${shopSuffix}`
+  const shopId      = shop?.id || null
+  const batchTag    = `LOT-${prefix}-IMPORT`
 
   const mediaMap = {}
   mediaRows.forEach(r => {
@@ -122,7 +128,7 @@ function parseProducts(salesRows, mediaRows, platform) {
         cost:parseFloat((price*0.5).toFixed(2)), price,
         shopee_sku:isShopee?rawSku:null, lazada_sku:!isShopee?rawSku:null,
         min_stock:30, reorder_days:30, has_expiry:false,
-        platform, category:cat, photo_url:img||null
+        platform, category:cat, photo_url:img||null, shop_id:shopId
       })
       if (qty>0) batches.push({
         id:crypto.randomUUID(), product_id:vid,
@@ -137,7 +143,7 @@ function parseProducts(salesRows, mediaRows, platform) {
         cost:0, price:0,
         shopee_sku:isShopee?pid:null, lazada_sku:!isShopee?pid:null,
         min_stock:30, reorder_days:30, has_expiry:false,
-        platform, category:cat, photo_url:cover||null
+        platform, category:cat, photo_url:cover||null, shop_id:shopId
       })
       variants.forEach((v,i) => {
         const vid=crypto.randomUUID()
@@ -152,7 +158,7 @@ function parseProducts(salesRows, mediaRows, platform) {
           cost:parseFloat((price*0.5).toFixed(2)), price,
           shopee_sku:isShopee?rawSku:null, lazada_sku:!isShopee?rawSku:null,
           min_stock:30, reorder_days:30, has_expiry:false,
-          platform, category:cat, photo_url:vimg||null
+          platform, category:cat, photo_url:vimg||null, shop_id:shopId
         })
         if (qty>0) batches.push({
           id:crypto.randomUUID(), product_id:vid,
@@ -276,6 +282,8 @@ async function doUpload(products, batches, dupAction, dupSkus, onProgress) {
 // ════════════════════════════════════════════════════════════════
 export default function ImportPage({ shout, refetch }) {
   const [platform,  setPlatform]  = useState('Shopee MY')
+  const [shops,     setShops]     = useState([])          // 当前平台底下的店铺账号列表
+  const [shopId,    setShopId]    = useState('')
   const [salesFile, setSalesFile] = useState(null)
   const [mediaFile, setMediaFile] = useState(null)
   // steps: upload → checking → conflict → uploading → done
@@ -290,6 +298,17 @@ export default function ImportPage({ shout, refetch }) {
   const isShopee = platform.startsWith('Shopee')
   const addLog   = msg => setLogs(p=>[...p,msg])
 
+  // 平台一换，重新拉这个平台底下的店铺账号
+  useEffect(() => {
+    setShopId('')
+    supabase.from('shops').select('id,shop_code,shop_name').eq('platform', platform)
+      .order('shop_code').then(({ data, error }) => {
+        if (error) { console.error('读取店铺列表失败:', error); setShops([]); return }
+        setShops(data||[])
+        if ((data||[]).length===1) setShopId(data[0].id)   // 只有一个店就直接选上，省一步
+      })
+  }, [platform])
+
   const reset = () => {
     setSalesFile(null); setMediaFile(null); setParsed(null)
     setDupInfo(null); setDupAction(null); setStep('upload')
@@ -299,6 +318,8 @@ export default function ImportPage({ shout, refetch }) {
   // ── Step 1: Parse + check duplicates ──────────────────────
   const handleParse = async () => {
     if (!salesFile) { shout('请先上传主文件',true); return }
+    if (!shopId) { shout('请先选择这批数据属于哪个店铺账号',true); return }
+    const shop = shops.find(s=>s.id===shopId)
     setLogs([]); setStep('checking')
     try {
       addLog('读取 Excel 文件…')
@@ -312,8 +333,8 @@ export default function ImportPage({ shout, refetch }) {
       }
       addLog(`字段：${Object.keys(salesRows[0]).slice(0,5).join(' | ')}`)
 
-      addLog('解析产品结构…')
-      const result = parseProducts(salesRows, mediaRows, platform)
+      addLog(`解析产品结构…（店铺：${shop?.shop_name||shop?.shop_code}）`)
+      const result = parseProducts(salesRows, mediaRows, platform, shop)
       addLog(`✅ 解析完成：${result.products.length} 个产品/变体，${result.batches.length} 笔库存`)
 
       addLog('检查数据库是否有重复 SKU…')
@@ -415,6 +436,26 @@ export default function ImportPage({ shout, refetch }) {
             ))}
           </div>
 
+          <div style={S.secTitle}>选择店铺账号</div>
+          {shops.length===0 ? (
+            <div style={{fontSize:11,color:C.slateLight,marginBottom:12}}>
+              这个平台底下还没有建店铺账号，先去 Supabase 的 shops 表加一条
+            </div>
+          ) : (
+            <div style={{display:'flex',flexWrap:'wrap',gap:8,marginBottom:12}}>
+              {shops.map(s=>(
+                <button key={s.id} onClick={()=>setShopId(s.id)}
+                  style={{padding:'7px 14px',borderRadius:20,border:'none',cursor:'pointer',
+                    background:shopId===s.id?C.blue:C.cream,
+                    color:shopId===s.id?'#fff':C.slate,
+                    fontWeight:shopId===s.id?700:400,fontSize:12}}>
+                  🏪 {s.shop_name || `店铺 ${s.shop_code}`}
+                </button>
+              ))}
+            </div>
+          )}
+
+
           {[
             {
               key:'sales', file:salesFile, set:setSalesFile, required:true,
@@ -451,7 +492,7 @@ export default function ImportPage({ shout, refetch }) {
             </div>
           ))}
 
-          <button onClick={handleParse} disabled={!salesFile||step==='checking'}
+          <button onClick={handleParse} disabled={!salesFile||!shopId||step==='checking'}
             style={{...S.btn(!salesFile||step==='checking'?C.slateLight:C.orange),
                     opacity:salesFile&&step!=='checking'?1:0.5}}>
             {step==='checking'?'⏳ 解析检查中…':'🔍 解析并检查重复'}
@@ -686,3 +727,5 @@ export default function ImportPage({ shout, refetch }) {
         </div>
       )}
     </div>
+  )
+}

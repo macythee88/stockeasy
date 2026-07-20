@@ -1,7 +1,7 @@
 // src/pages/OrdersPage.jsx
 // Full order management: pick list + dispatch + returns + print
 
-import { useState, useMemo, useRef } from 'react'
+import { useState, useMemo, useRef, useEffect } from 'react'
 import { C, S } from '../App'
 import * as XLSX from 'xlsx'
 import { supabase } from '../lib/supabase'
@@ -165,7 +165,7 @@ const SHOPEE_STATUS_MAP = {
   'to return / refund':'return', 'in cancellation':'return',
 }
 
-function parseOrderXlsx(buffer, platform, products) {
+function parseOrderXlsx(buffer, platform, products, shop) {
   const wb  = XLSX.read(new Uint8Array(buffer), { type:'array' })
   const ws  = wb.Sheets[wb.SheetNames[0]]
   const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:'' })
@@ -195,7 +195,11 @@ function parseOrderXlsx(buffer, platform, products) {
   // 这种情况下退而求其次按「商品名 + 变体名」精确匹配
   const bySku = new Map((products||[]).map(p=>[p.sku, p]))
   const byNameVariant = new Map((products||[]).map(p=>[`${(p.name||'').trim()}::${(p.variant_name||'').trim()}`, p]))
-  const prefix = ORDER_SKU_PREFIX[platform] || ''
+  // SKU 前缀带上店铺编号，要跟 ImportPage.jsx 建产品时用的前缀完全一致才能匹配上
+  // 「店铺1」当默认店铺、不加后缀（对齐旧数据），店铺2+ 才加数字后缀
+  const shopSuffix = (shop?.shop_code && shop.shop_code!=='1') ? shop.shop_code : ''
+  const prefix = `${ORDER_SKU_PREFIX[platform]||''}${shopSuffix}`
+  const shopId = shop?.id || null
   const unmatched = []
   let skipped = 0
 
@@ -243,7 +247,7 @@ function parseOrderXlsx(buffer, platform, products) {
 
     if (!grouped.has(orderId)) {
       grouped.set(orderId, {
-        id: orderId, platform, status,
+        id: orderId, platform, status, shop_id: shopId,
         customer: customerName, total: 0,
         created_at: createdAt ? safeParseDate(createdAt) : new Date().toISOString(),
         items: [],
@@ -291,7 +295,7 @@ async function writeOrdersToSupabase(orders) {
   for (let i=0;i<orders.length;i+=CHUNK) {
     const chunk = orders.slice(i,i+CHUNK)
     const orderRows = chunk.map(o=>({
-      id:o.id, platform:o.platform, status:o.status,
+      id:o.id, platform:o.platform, status:o.status, shop_id:o.shop_id||null,
       customer:o.customer, total:Math.round((o.total||0)*100)/100,
       created_at:o.created_at,
     }))
@@ -324,6 +328,19 @@ export default function OrdersPage({ orders, counts, loading, markProcessed, mar
   const [showPickList, setShowPickList] = useState(true)
   const [showImport,   setShowImport]   = useState(false)
   const [importPlat,   setImportPlat]   = useState('Shopee SG')
+  const [importShops,  setImportShops]  = useState([])
+  const [importShopId, setImportShopId] = useState('')
+
+  // 平台一换，重新拉这个平台底下的店铺账号（跟 ImportPage.jsx 逻辑一致）
+  useEffect(() => {
+    setImportShopId('')
+    supabase.from('shops').select('id,shop_code,shop_name').eq('platform', importPlat)
+      .order('shop_code').then(({ data, error }) => {
+        if (error) { console.error('读取店铺列表失败:', error); setImportShops([]); return }
+        setImportShops(data||[])
+        if ((data||[]).length===1) setImportShopId(data[0].id)
+      })
+  }, [importPlat])
   const [returnModal,  setReturnModal]  = useState(null)
   const [returnReason, setReturnReason] = useState('')
   const [searchQ,      setSearchQ]      = useState('')
@@ -371,14 +388,29 @@ export default function OrdersPage({ orders, counts, loading, markProcessed, mar
     else shout(`⚠ ${ok}/${ids.length} 张成功，${ids.length-ok} 张失败，请检查网络或权限设置`, ok===0)
   }
 
+  // 一键全部发货：不用一个个勾，直接把当前看到的所有未处理订单标记发货
+  const handleCompleteAll = async () => {
+    if (!filteredOrders.length) return
+    const sure = window.confirm(
+      `确定要把当前这 ${filteredOrders.length} 张订单全部标记为「已发货」吗？\n（这个操作不能撤销，请确认这些订单真的都已经打包发出）`
+    )
+    if (!sure) return
+    let ok = 0
+    for (const o of filteredOrders) { if (await markProcessed(o.id)) ok++ }
+    if (ok === filteredOrders.length) shout(`✓ 全部 ${ok} 张订单已发货`)
+    else shout(`⚠ ${ok}/${filteredOrders.length} 张成功，${filteredOrders.length-ok} 张失败，请检查网络或权限设置`, ok===0)
+  }
+
   // ── Import from Excel：先解析 + 匹配，预览确认后再写入 ──────────
   const handleImportFile = async (e) => {
     const file = e.target.files[0]; if (!file) return
+    if (!importShopId) { shout('请先选择这批订单属于哪个店铺账号',true); e.target.value=''; return }
+    const shop = importShops.find(s=>s.id===importShopId)
     setImportPreview(null)
     const reader = new FileReader()
     reader.onload = ev => {
       try {
-        const result = parseOrderXlsx(ev.target.result, importPlat, products)
+        const result = parseOrderXlsx(ev.target.result, importPlat, products, shop)
         if (!result.headerFound) { shout('无法识别表头，请确认这是订单导出文件',true); return }
         if (result.orders.length===0) {
           shout(result.skipped>0 ? `全部 ${result.skipped} 行都是已取消订单，没有需要导入的内容` : '没有解析到任何订单行', true)
@@ -453,14 +485,29 @@ export default function OrdersPage({ orders, counts, loading, markProcessed, mar
               </button>
             ))}
           </div>
+
+          {importShops.length>0 && (
+            <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:10}}>
+              {importShops.map(s=>(
+                <button key={s.id} onClick={()=>setImportShopId(s.id)}
+                  style={{padding:'5px 12px',borderRadius:20,border:'none',cursor:'pointer',
+                    background:importShopId===s.id?C.navy:'#f0f0f0',
+                    color:importShopId===s.id?'#fff':C.slate,fontSize:11,fontWeight:importShopId===s.id?700:400}}>
+                  🏪 {s.shop_name || `店铺 ${s.shop_code}`}
+                </button>
+              ))}
+            </div>
+          )}
+
           <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" style={{display:'none'}}
             onChange={handleImportFile}/>
-          <button onClick={()=>fileRef.current?.click()} style={S.btn(C.blue)}>
+          <button onClick={()=>fileRef.current?.click()} disabled={!importShopId}
+            style={{...S.btn(C.blue),opacity:importShopId?1:0.5}}>
             📄 选择 Excel 文件导入
           </button>
           <div style={{fontSize:10,color:C.slateLight,marginTop:6,lineHeight:1.7}}>
-            支持 Shopee / Lazada 订单导出文件（Excel/CSV）<br/>
-            系统自动识别订单号、产品、数量、客户信息
+            {importShopId ? <>支持 Shopee / Lazada 订单导出文件（Excel/CSV）<br/>系统自动识别订单号、产品、数量、客户信息</>
+                          : '⚠️ 请先选择店铺账号'}
           </div>
 
           {/* ── 解析预览：确认无误再写入数据库 ────────────────── */}
@@ -608,10 +655,16 @@ export default function OrdersPage({ orders, counts, loading, markProcessed, mar
               {Object.values(checked).filter(Boolean).length} 已勾选
             </span>
           </div>
-          <button onClick={handleBatchProcess}
-            style={{...S.btn(C.green,false,true)}}>
-            ✅ 批量发货
-          </button>
+          <div style={{display:'flex',gap:6}}>
+            <button onClick={handleBatchProcess}
+              style={{...S.btn(C.green,false,true)}}>
+              ✅ 批量发货（已勾选）
+            </button>
+            <button onClick={handleCompleteAll}
+              style={{...S.btn(C.red,false,true)}}>
+              ⚡ 一键全部发货
+            </button>
+          </div>
         </div>
       )}
 
