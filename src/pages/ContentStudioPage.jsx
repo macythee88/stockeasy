@@ -111,6 +111,7 @@ export default function ContentStudioPage({ shout }) {
   const [loading,  setLoading]  = useState(false)
   const [useSearch, setUseSearch] = useState(false)
   const [searchQueries, setSearchQueries] = useState([])
+  const [modelUsed, setModelUsed] = useState('')
   const [template, setTemplate] = useState('minimal')
   const [layers,   setLayers]   = useState(null)
   const [selectedId, setSelectedId] = useState(null)
@@ -156,6 +157,7 @@ export default function ContentStudioPage({ shout }) {
       }
       setLayers(defaultLayers(copy))
       setSearchQueries(data._searchQueries || [])
+      setModelUsed(data._modelUsed || '')
       shout('文案生成好了，可以开始拖拽排版了 ✓')
     } catch(e) {
       shout('生成失败：'+(e.message||'请检查网络或后台设置'), true)
@@ -287,6 +289,11 @@ export default function ContentStudioPage({ shout }) {
           style={{...S.btn(C.orange),marginTop:12,opacity:(!file||loading)?0.6:1}}>
           {loading?(useSearch?'🔍 搜索 + 生成中…':'🪄 AI 生成中…'):(layers?'🔄 重新生成文案':'🪄 生成卖点文案（免费）')}
         </button>
+        {modelUsed && (
+          <div style={{fontSize:10,color:C.slateLight,marginTop:8}}>
+            🤖 这次用的型号：{modelUsed}
+          </div>
+        )}
         {searchQueries.length>0 && (
           <div style={{fontSize:10,color:C.slateLight,marginTop:8}}>
             🔍 刚才搜索了：{searchQueries.join('、')}
