@@ -1,6 +1,6 @@
 // src/pages/ContentStudioPage.jsx
-// 智能作图 · AI 营销工作台（v2：可拖拽排版 + 自定义标注贴纸）
-// 流程：上传实物图 → AI 生成卖点文案 → 拖拽调整图片/文字位置、颜色、大小 → 加标注贴纸 → 下载
+// 智能作图 · AI 营销工作台（v3：双语文案 + 版面模板 + 拖拽排版 + 标注贴纸）
+// 流程：上传实物图 → AI 生成中英双语文案 → 选版面模板 → 拖拽微调 → 加标注 → 下载
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { C, S } from '../App'
 import { supabase } from '../lib/supabase'
@@ -12,6 +12,48 @@ const BG_STYLES = {
   pastel:  { label:'柔和种草风', bg:'#FFF0EE' },
 }
 const BADGE_COLORS = ['#F39C12','#EE4D2D','#2ECC71','#3498DB','#9B59B6','#0F1B2D']
+const LANGS = { zh:'中文', en:'英文', both:'中英双语' }
+
+// ── 文案取值：按语言模式挑对应文字，双语就中英各一行 ──────────
+const pickText = (zh, en, lang) => {
+  if (lang==='en') return en || zh || ''
+  if (lang==='both') return en ? `${zh}\n${en}` : (zh||'')
+  return zh || en || ''
+}
+
+// ── 版面模板：决定各元素默认摆放位置，跟"背景风格"是分开的两件事 ──
+const LAYOUTS = {
+  classic: {
+    label: '标准竖版（标语上·卖点下）',
+    build: (copy, lang) => ([
+      { id:'img',  type:'image', x:CANVAS_SIZE/2, y:CANVAS_SIZE*0.5, w:CANVAS_SIZE*0.55, h:CANVAS_SIZE*0.55 },
+      { id:'tagline', type:'text', x:CANVAS_SIZE/2, y:66, text:pickText(copy.tagline,copy.tagline_en,lang), fontSize:36, color:'#0F1B2D', bold:true, align:'center' },
+      { id:'sp0', type:'text', x:CANVAS_SIZE/2, y:CANVAS_SIZE-120, text:pickText('✓ '+copy.selling_points[0], copy.selling_points_en?.[0], lang), fontSize:20, color:'#4A6080', align:'center' },
+      { id:'sp1', type:'text', x:CANVAS_SIZE/2, y:CANVAS_SIZE-80,  text:pickText('✓ '+copy.selling_points[1], copy.selling_points_en?.[1], lang), fontSize:20, color:'#4A6080', align:'center' },
+      { id:'sp2', type:'text', x:CANVAS_SIZE/2, y:CANVAS_SIZE-40,  text:pickText('✓ '+copy.selling_points[2], copy.selling_points_en?.[2], lang), fontSize:20, color:'#4A6080', align:'center' },
+    ]),
+  },
+  sideBullets: {
+    label: '卖点侧边版（标语上·卖点右）',
+    build: (copy, lang) => ([
+      { id:'img',  type:'image', x:CANVAS_SIZE*0.36, y:CANVAS_SIZE*0.56, w:CANVAS_SIZE*0.56, h:CANVAS_SIZE*0.56 },
+      { id:'tagline', type:'text', x:CANVAS_SIZE/2, y:60, text:pickText(copy.tagline,copy.tagline_en,lang), fontSize:32, color:'#0F1B2D', bold:true, align:'center' },
+      { id:'sp0', type:'text', x:CANVAS_SIZE*0.72, y:CANVAS_SIZE*0.42, text:pickText('✓ '+copy.selling_points[0], copy.selling_points_en?.[0], lang), fontSize:18, color:'#4A6080', align:'left' },
+      { id:'sp1', type:'text', x:CANVAS_SIZE*0.72, y:CANVAS_SIZE*0.56, text:pickText('✓ '+copy.selling_points[1], copy.selling_points_en?.[1], lang), fontSize:18, color:'#4A6080', align:'left' },
+      { id:'sp2', type:'text', x:CANVAS_SIZE*0.72, y:CANVAS_SIZE*0.70, text:pickText('✓ '+copy.selling_points[2], copy.selling_points_en?.[2], lang), fontSize:18, color:'#4A6080', align:'left' },
+    ]),
+  },
+  bigPromo: {
+    label: '促销大字版（标语超大·卖点一排）',
+    build: (copy, lang) => ([
+      { id:'img',  type:'image', x:CANVAS_SIZE/2, y:CANVAS_SIZE*0.46, w:CANVAS_SIZE*0.48, h:CANVAS_SIZE*0.48 },
+      { id:'tagline', type:'text', x:CANVAS_SIZE/2, y:80, text:pickText(copy.tagline,copy.tagline_en,lang), fontSize:44, color:'#fff', bold:true, align:'center' },
+      { id:'sp0', type:'badge', x:CANVAS_SIZE*0.2, y:CANVAS_SIZE-70, text:pickText(copy.selling_points[0], copy.selling_points_en?.[0], lang==='both'?'zh':lang), fontSize:15, color:'#0F1B2D', bg:'#fff' },
+      { id:'sp1', type:'badge', x:CANVAS_SIZE*0.5, y:CANVAS_SIZE-70, text:pickText(copy.selling_points[1], copy.selling_points_en?.[1], lang==='both'?'zh':lang), fontSize:15, color:'#0F1B2D', bg:'#fff' },
+      { id:'sp2', type:'badge', x:CANVAS_SIZE*0.8, y:CANVAS_SIZE-70, text:pickText(copy.selling_points[2], copy.selling_points_en?.[2], lang==='both'?'zh':lang), fontSize:15, color:'#0F1B2D', bg:'#fff' },
+    ]),
+  },
+}
 
 // ── 画布绘制 ─────────────────────────────────────────────────
 function roundRectPath(ctx,x,y,w,h,r) {
@@ -24,13 +66,26 @@ function roundRectPath(ctx,x,y,w,h,r) {
   ctx.closePath()
 }
 
-function drawScene(canvas, layers, imgEl, template, selectedId) {
+// 支持 \n 换行的文字绘制（双语模式一行中文一行英文），返回整块的宽高给拖拽判定用
+function drawMultilineText(ctx, text, x, y, fontSize, align) {
+  const lines = String(text||'').split('\n')
+  const lineHeight = fontSize * 1.25
+  const totalH = lineHeight * lines.length
+  const startY = y - totalH/2 + lineHeight/2
+  let maxW = 0
+  lines.forEach((line,i) => {
+    ctx.fillText(line, x, startY + i*lineHeight)
+    maxW = Math.max(maxW, ctx.measureText(line).width)
+  })
+  return { w:maxW, h:totalH }
+}
+
+function drawScene(canvas, layers, imgEl, bgStyle, selectedId) {
   const size = CANVAS_SIZE
   canvas.width = size; canvas.height = size
   const ctx = canvas.getContext('2d')
 
-  // 背景
-  const style = BG_STYLES[template] || BG_STYLES.minimal
+  const style = BG_STYLES[bgStyle] || BG_STYLES.minimal
   if (style.bg === 'gradient') {
     const g = ctx.createLinearGradient(0,0,size,size)
     g.addColorStop(0,'#FF6B35'); g.addColorStop(1,'#E74C3C')
@@ -53,11 +108,13 @@ function drawScene(canvas, layers, imgEl, template, selectedId) {
     } else if (l.type === 'text') {
       ctx.font = `${l.bold?'bold ':''}${l.fontSize}px sans-serif`
       ctx.fillStyle = l.color
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
-      ctx.fillText(l.text, l.x, l.y)
-      const w = ctx.measureText(l.text).width
-      l._w = w; l._h = l.fontSize*1.3
-      if (l.id === selectedId) drawSelectionBox(ctx, l.x-w/2-6, l.y-l._h/2, w+12, l._h)
+      ctx.textAlign = l.align || 'center'; ctx.textBaseline = 'middle'
+      const { w, h } = drawMultilineText(ctx, l.text, l.x, l.y, l.fontSize, l.align)
+      l._w = w; l._h = h
+      if (l.id === selectedId) {
+        const boxX = l.align==='left' ? l.x-6 : l.x-w/2-6
+        drawSelectionBox(ctx, boxX, l.y-h/2, w+12, h)
+      }
 
     } else if (l.type === 'badge') {
       ctx.font = `bold ${l.fontSize}px sans-serif`
@@ -88,6 +145,9 @@ function hitTest(layers, px, py) {
     const l = layers[i]
     if (l.type==='image') {
       if (px>=l.x-l.w/2 && px<=l.x+l.w/2 && py>=l.y-l.h/2 && py<=l.y+l.h/2) return l.id
+    } else if (l.type==='text' && l.align==='left') {
+      const w=(l._w||80)+16, h=(l._h||24)+16
+      if (px>=l.x-16 && px<=l.x-16+w && py>=l.y-h/2 && py<=l.y+h/2) return l.id
     } else {
       const w = (l._w||80)+16, h = (l._h||24)+16
       if (px>=l.x-w/2 && px<=l.x+w/2 && py>=l.y-h/2 && py<=l.y+h/2) return l.id
@@ -95,14 +155,6 @@ function hitTest(layers, px, py) {
   }
   return null
 }
-
-const defaultLayers = (copy) => ([
-  { id:'img',  type:'image', x:CANVAS_SIZE/2, y:CANVAS_SIZE*0.5, w:CANVAS_SIZE*0.6, h:CANVAS_SIZE*0.6 },
-  { id:'tagline', type:'text', x:CANVAS_SIZE/2, y:70, text:copy.tagline, fontSize:38, color:'#0F1B2D', bold:true },
-  { id:'sp0', type:'text', x:CANVAS_SIZE/2, y:CANVAS_SIZE-110, text:'✓ '+copy.selling_points[0], fontSize:22, color:'#4A6080' },
-  { id:'sp1', type:'text', x:CANVAS_SIZE/2, y:CANVAS_SIZE-78,  text:'✓ '+copy.selling_points[1], fontSize:22, color:'#4A6080' },
-  { id:'sp2', type:'text', x:CANVAS_SIZE/2, y:CANVAS_SIZE-46,  text:'✓ '+copy.selling_points[2], fontSize:22, color:'#4A6080' },
-])
 
 export default function ContentStudioPage({ shout }) {
   const [file,     setFile]     = useState(null)
@@ -112,7 +164,11 @@ export default function ContentStudioPage({ shout }) {
   const [useSearch, setUseSearch] = useState(false)
   const [searchQueries, setSearchQueries] = useState([])
   const [modelUsed, setModelUsed] = useState('')
-  const [template, setTemplate] = useState('minimal')
+  const [copy,     setCopy]     = useState(null)     // AI 原始返回（中英都有），排版模板/语言切换时用来重建 layers
+  const [description, setDescription] = useState('') // Step 1「看图」缓存下来的商品描述，重新生成文案时不用再看一次图
+  const [bgStyle,  setBgStyle]  = useState('minimal')
+  const [layoutId, setLayoutId] = useState('classic')
+  const [lang,     setLang]     = useState('zh')
   const [layers,   setLayers]   = useState(null)
   const [selectedId, setSelectedId] = useState(null)
 
@@ -123,7 +179,7 @@ export default function ContentStudioPage({ shout }) {
 
   const handlePick = (e) => {
     const f = e.target.files[0]; if (!f) return
-    setFile(f); setLayers(null); setSelectedId(null)
+    setFile(f); setLayers(null); setCopy(null); setSelectedId(null); setDescription('')
     setImgUrl(URL.createObjectURL(f))
   }
 
@@ -131,33 +187,40 @@ export default function ContentStudioPage({ shout }) {
     if (!file) { shout('请先上传商品图片',true); return }
     setLoading(true)
     try {
-      const base64 = await new Promise((resolve,reject) => {
-        const reader = new FileReader()
-        reader.onload = () => resolve(reader.result.split(',')[1])
-        reader.onerror = reject
-        reader.readAsDataURL(file)
-      })
+      // 已经看过图、缓存了商品描述的话（重新生成文案时），就不用再传图片重新分析一次，
+      // 省下 Gemini 那份较小的看图额度，只重新调用文案模型（额度大很多）
+      let base64 = null
+      if (!description) {
+        base64 = await new Promise((resolve,reject) => {
+          const reader = new FileReader()
+          reader.onload = () => resolve(reader.result.split(',')[1])
+          reader.onerror = reject
+          reader.readAsDataURL(file)
+        })
+      }
       const { data, error } = await supabase.functions.invoke('generate-copy', {
-        body: { image: base64, mediaType: file.type||'image/jpeg', context, useSearch },
+        body: { image: base64, mediaType: file.type||'image/jpeg', context, useSearch, description },
       })
       if (error) {
-        // supabase-js 遇到非 2xx 响应时，error.message 只会给一句很笼统的提示，
-        // 真正的错误原因要自己从 error.context（原始 Response）里读出来
         let detail = error.message
-        try {
-          const body = await error.context.json()
-          if (body?.error) detail = body.error
-        } catch {}
+        try { const body = await error.context.json(); if (body?.error) detail = body.error } catch {}
         throw new Error(detail)
       }
       if (data?.error) throw new Error(data.error)
-      const copy = {
+
+      const newCopy = {
         tagline: data.tagline || '主标语',
-        selling_points: (data.selling_points && data.selling_points.length===3) ? data.selling_points : ['卖点1','卖点2','卖点3'],
+        tagline_en: data.tagline_en || '',
+        selling_points: (data.selling_points?.length===3) ? data.selling_points : ['卖点1','卖点2','卖点3'],
+        selling_points_en: data.selling_points_en?.length===3 ? data.selling_points_en : ['','',''],
+        product_summary: data.product_summary || '',
+        product_summary_en: data.product_summary_en || '',
       }
-      setLayers(defaultLayers(copy))
+      setCopy(newCopy)
+      setLayers(LAYOUTS[layoutId].build(newCopy, lang))
       setSearchQueries(data._searchQueries || [])
       setModelUsed(data._modelUsed || '')
+      setDescription(data._description || '')
       shout('文案生成好了，可以开始拖拽排版了 ✓')
     } catch(e) {
       shout('生成失败：'+(e.message||'请检查网络或后台设置'), true)
@@ -165,7 +228,6 @@ export default function ContentStudioPage({ shout }) {
     setLoading(false)
   }
 
-  // 图片加载
   useEffect(() => {
     if (!imgUrl) { imgElRef.current = null; return }
     const img = new Image()
@@ -177,8 +239,8 @@ export default function ContentStudioPage({ shout }) {
 
   const redraw = useCallback(() => {
     if (!canvasRef.current || !layers) return
-    drawScene(canvasRef.current, layers, imgElRef.current, template, selectedId)
-  }, [layers, template, selectedId])
+    drawScene(canvasRef.current, layers, imgElRef.current, bgStyle, selectedId)
+  }, [layers, bgStyle, selectedId])
 
   useEffect(() => { redraw() }, [redraw])
 
@@ -231,11 +293,21 @@ export default function ContentStudioPage({ shout }) {
     setLayers(ls => ls.filter(l=>l.id!==selectedId))
     setSelectedId(null)
   }
+
+  // 换版面模板 / 换语言：照当前选择重新生成默认排版（会丢掉手动拖拽的位置，标注贴纸也会清空，先提醒一下）
+  const applyLayout = (id) => {
+    setLayoutId(id)
+    if (copy) setLayers(LAYOUTS[id].build(copy, lang))
+    setSelectedId(null)
+  }
+  const applyLang = (l) => {
+    setLang(l)
+    if (copy) setLayers(LAYOUTS[layoutId].build(copy, l))
+    setSelectedId(null)
+  }
   const resetLayout = () => {
-    if (!layers) return
-    const tagline = layers.find(l=>l.id==='tagline')?.text || ''
-    const sp = ['sp0','sp1','sp2'].map(id => (layers.find(l=>l.id===id)?.text||'').replace(/^✓\s*/,''))
-    setLayers(defaultLayers({ tagline, selling_points: sp }))
+    if (!copy) return
+    setLayers(LAYOUTS[layoutId].build(copy, lang))
     setSelectedId(null)
   }
 
@@ -247,7 +319,7 @@ export default function ContentStudioPage({ shout }) {
       link.download = `营销图_${Date.now()}.png`
       link.href = canvasRef.current.toDataURL('image/png')
       link.click()
-    }, 50) // 等取消选中框重画一次，下载的图不带蓝色虚线框
+    }, 50)
   }
 
   return (
@@ -287,11 +359,24 @@ export default function ContentStudioPage({ shout }) {
 
         <button onClick={handleGenerate} disabled={!file||loading}
           style={{...S.btn(C.orange),marginTop:12,opacity:(!file||loading)?0.6:1}}>
-          {loading?(useSearch?'🔍 搜索 + 生成中…':'🪄 AI 生成中…'):(layers?'🔄 重新生成文案':'🪄 生成卖点文案（免费）')}
+          {loading?(useSearch?'🔍 搜索 + 生成中…':'🪄 AI 生成中…'):(copy?'🔄 重新生成文案':'🪄 生成卖点文案（免费）')}
         </button>
+
+        {copy?.product_summary && (
+          <div style={{fontSize:11,color:C.navy,marginTop:10,padding:'8px 10px',
+                      background:C.cream,borderRadius:8}}>
+            🤖 AI 识别的商品：{copy.product_summary}
+            {copy.product_summary_en && <><br/><span style={{color:C.slate}}>{copy.product_summary_en}</span></>}
+          </div>
+        )}
         {modelUsed && (
           <div style={{fontSize:10,color:C.slateLight,marginTop:8}}>
             🤖 这次用的型号：{modelUsed}
+          </div>
+        )}
+        {useSearch && searchQueries.length===0 && modelUsed && (
+          <div style={{fontSize:10,color:C.slateLight,marginTop:4}}>
+            🔍 这次没有真的触发联网搜索（AI 判断看图 + 补充说明就够用了）
           </div>
         )}
         {searchQueries.length>0 && (
@@ -304,7 +389,7 @@ export default function ContentStudioPage({ shout }) {
       {layers && (
         <div style={S.card}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
-            <div style={S.secTitle}>2. 拖拽排版 · 点一下选中再调整</div>
+            <div style={S.secTitle}>2. 选版面 + 拖拽排版</div>
             <button onClick={resetLayout}
               style={{background:'none',border:`1px solid ${C.slate}40`,borderRadius:6,
                      padding:'3px 9px',fontSize:10,color:C.slate,cursor:'pointer'}}>
@@ -312,14 +397,40 @@ export default function ContentStudioPage({ shout }) {
             </button>
           </div>
 
-          <div style={{display:'flex',gap:8,marginBottom:10,flexWrap:'wrap'}}>
+          <div style={{fontSize:11,fontWeight:700,color:C.slate,marginBottom:6}}>版面模板</div>
+          <div style={{display:'flex',flexDirection:'column',gap:6,marginBottom:12}}>
+            {Object.entries(LAYOUTS).map(([id,l])=>(
+              <button key={id} onClick={()=>applyLayout(id)}
+                style={{padding:'8px 12px',borderRadius:10,border:`2px solid ${layoutId===id?C.orange:C.slateLight+'40'}`,
+                  background:layoutId===id?C.orange+'10':'#fff',cursor:'pointer',textAlign:'left',
+                  fontSize:12,fontWeight:layoutId===id?700:400,color:layoutId===id?C.orange:C.navy}}>
+                {l.label}
+              </button>
+            ))}
+          </div>
+
+          <div style={{fontSize:11,fontWeight:700,color:C.slate,marginBottom:6}}>背景风格</div>
+          <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
             {Object.entries(BG_STYLES).map(([id,s])=>(
-              <button key={id} onClick={()=>setTemplate(id)}
+              <button key={id} onClick={()=>setBgStyle(id)}
                 style={{padding:'6px 12px',borderRadius:20,border:'none',cursor:'pointer',
-                  background:template===id?C.orange:C.cream,
-                  color:template===id?'#fff':C.slate,
-                  fontWeight:template===id?700:400,fontSize:11}}>
+                  background:bgStyle===id?C.orange:C.cream,
+                  color:bgStyle===id?'#fff':C.slate,
+                  fontWeight:bgStyle===id?700:400,fontSize:11}}>
                 {s.label}
+              </button>
+            ))}
+          </div>
+
+          <div style={{fontSize:11,fontWeight:700,color:C.slate,marginBottom:6}}>文案语言</div>
+          <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
+            {Object.entries(LANGS).map(([id,label])=>(
+              <button key={id} onClick={()=>applyLang(id)}
+                style={{padding:'6px 12px',borderRadius:20,border:'none',cursor:'pointer',
+                  background:lang===id?C.blue:C.cream,
+                  color:lang===id?'#fff':C.slate,
+                  fontWeight:lang===id?700:400,fontSize:11}}>
+                {label}
               </button>
             ))}
           </div>
@@ -336,7 +447,6 @@ export default function ContentStudioPage({ shout }) {
             🏷 添加标注贴纸（尺寸/须知/亮点…）
           </button>
 
-          {/* ── 选中元素的调整面板 ─────────────────────────── */}
           {selectedLayer && (
             <div style={{marginTop:12,padding:'10px 12px',background:C.cream,borderRadius:10}}>
               <div style={{fontSize:11,fontWeight:700,color:C.navy,marginBottom:8}}>
@@ -345,8 +455,8 @@ export default function ContentStudioPage({ shout }) {
 
               {selectedLayer.type !== 'image' && (
                 <div style={{marginBottom:8}}>
-                  <label style={S.lbl}>内容</label>
-                  <input style={S.inp} value={selectedLayer.text}
+                  <label style={S.lbl}>内容{selectedLayer.text.includes('\n') ? '（换行分隔中英文）':''}</label>
+                  <textarea style={{...S.inp,minHeight:selectedLayer.text.includes('\n')?56:36}} value={selectedLayer.text}
                     onChange={e=>updateSelected({text:e.target.value})}/>
                 </div>
               )}
