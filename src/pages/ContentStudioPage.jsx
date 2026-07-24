@@ -301,6 +301,8 @@ export default function ContentStudioPage({ shout }) {
         selling_points_en: data.selling_points_en?.length===3 ? data.selling_points_en : ['','',''],
         product_summary: data.product_summary || '',
         product_summary_en: data.product_summary_en || '',
+        long_description: data.long_description || '',
+        long_description_en: data.long_description_en || '',
       }
       setCopy(newCopy)
       setLayers(LAYOUTS[layoutId].build(newCopy, lang))
@@ -409,6 +411,11 @@ export default function ContentStudioPage({ shout }) {
     if (!copy) return
     setLayers(LAYOUTS[layoutId].build(copy, lang))
     setSelectedId(null)
+  }
+
+  const handleCopyText = async (text) => {
+    try { await navigator.clipboard.writeText(text); shout('已复制 ✓') }
+    catch { shout('复制失败，麻烦手动选取文字复制',true) }
   }
 
   const handleDownload = () => {
@@ -653,6 +660,43 @@ export default function ContentStudioPage({ shout }) {
           <button onClick={handleDownload} style={{...S.btn(C.green),marginTop:14}}>
             💾 下载营销图（{CANVAS_SIZE}×{CANVAS_SIZE} 高清）
           </button>
+        </div>
+      )}
+
+      {copy?.long_description && (
+        <div style={S.card}>
+          <div style={S.secTitle}>3. 商品详情页文案（复制去贴 Shopee/Lazada）</div>
+          <div style={{fontSize:11,color:C.slate,marginBottom:10,lineHeight:1.6}}>
+            这段不是印在图片上的，是给顾客点进商品详情页会读到的完整介绍——之后要做"一键上传"到平台，也是靠这段文案
+          </div>
+
+          <div style={{marginBottom:12}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+              <label style={S.lbl}>中文版</label>
+              <button onClick={()=>handleCopyText(copy.long_description)}
+                style={{background:'none',border:`1px solid ${C.slate}40`,borderRadius:6,
+                       padding:'3px 9px',fontSize:10,color:C.slate,cursor:'pointer'}}>
+                📋 复制
+              </button>
+            </div>
+            <textarea readOnly value={copy.long_description}
+              style={{...S.inp,minHeight:120,resize:'vertical'}}/>
+          </div>
+
+          {copy.long_description_en && (
+            <div>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+                <label style={S.lbl}>英文版</label>
+                <button onClick={()=>handleCopyText(copy.long_description_en)}
+                  style={{background:'none',border:`1px solid ${C.slate}40`,borderRadius:6,
+                         padding:'3px 9px',fontSize:10,color:C.slate,cursor:'pointer'}}>
+                  📋 复制
+                </button>
+              </div>
+              <textarea readOnly value={copy.long_description_en}
+                style={{...S.inp,minHeight:120,resize:'vertical'}}/>
+            </div>
+          )}
         </div>
       )}
     </div>
