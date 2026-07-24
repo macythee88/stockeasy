@@ -126,20 +126,32 @@ function drawMultilineText(ctx, text, x, y, fontSize) {
   return { w:maxW, h:totalH }
 }
 
-function drawScene(canvas, layers, imgEl, bgStyle, selectedId) {
+function drawScene(canvas, layers, imgEl, bgStyle, selectedId, customBgColor, customBgImgEl) {
   const size = CANVAS_SIZE
   canvas.width = size; canvas.height = size
   const ctx = canvas.getContext('2d')
 
-  const style = BG_STYLES[bgStyle] || BG_STYLES.minimal
-  if (style.bg === 'gradient') {
-    const g = ctx.createLinearGradient(0,0,size,size)
-    g.addColorStop(0,'#FF6B35'); g.addColorStop(1,'#E74C3C')
-    ctx.fillStyle = g
+  if (bgStyle === 'customImage' && customBgImgEl) {
+    // 自己上传的背景图，铺满整个画布（cover 方式，可能裁切超出部分）
+    const ir = customBgImgEl.width / customBgImgEl.height
+    let dw = size, dh = size, dx = 0, dy = 0
+    if (ir > 1) { dh = size; dw = size*ir; dx = -(dw-size)/2 }
+    else        { dw = size; dh = size/ir; dy = -(dh-size)/2 }
+    ctx.drawImage(customBgImgEl, dx, dy, dw, dh)
+  } else if (bgStyle === 'customColor') {
+    ctx.fillStyle = customBgColor
+    ctx.fillRect(0,0,size,size)
   } else {
-    ctx.fillStyle = style.bg
+    const style = BG_STYLES[bgStyle] || BG_STYLES.minimal
+    if (style.bg === 'gradient') {
+      const g = ctx.createLinearGradient(0,0,size,size)
+      g.addColorStop(0,'#FF6B35'); g.addColorStop(1,'#E74C3C')
+      ctx.fillStyle = g
+    } else {
+      ctx.fillStyle = style.bg
+    }
+    ctx.fillRect(0,0,size,size)
   }
-  ctx.fillRect(0,0,size,size)
 
   layers.forEach(l => {
     if (l.type === 'image') {
@@ -248,11 +260,16 @@ export default function ContentStudioPage({ shout }) {
   const [context,  setContext]  = useState('')
   const [loading,  setLoading]  = useState(false)
   const [useSearch, setUseSearch] = useState(false)
+  const [forceSearch, setForceSearch] = useState(false)
   const [searchQueries, setSearchQueries] = useState([])
   const [modelUsed, setModelUsed] = useState('')
   const [copy,     setCopy]     = useState(null)
   const [description, setDescription] = useState('')
   const [bgStyle,  setBgStyle]  = useState('minimal')
+  const [customBgColor, setCustomBgColor] = useState('#F0EAE0')
+  const [customBgUrl, setCustomBgUrl] = useState('')
+  const customBgElRef = useRef(null)
+  const customBgFileRef = useRef()
   const [layoutId, setLayoutId] = useState('classic')
   const [lang,     setLang]     = useState('zh')
   const [layers,   setLayers]   = useState(null)
@@ -285,7 +302,7 @@ export default function ContentStudioPage({ shout }) {
         })
       }
       const { data, error } = await supabase.functions.invoke('generate-copy', {
-        body: { image: base64, mediaType: file.type||'image/jpeg', context, useSearch, description },
+        body: { image: base64, mediaType: file.type||'image/jpeg', context, useSearch, forceSearch, description },
       })
       if (error) {
         let detail = error.message
@@ -327,10 +344,18 @@ export default function ContentStudioPage({ shout }) {
 
   const redraw = useCallback(() => {
     if (!canvasRef.current || !layers) return
-    drawScene(canvasRef.current, layers, imgElRef.current, bgStyle, selectedId)
-  }, [layers, bgStyle, selectedId])
+    drawScene(canvasRef.current, layers, imgElRef.current, bgStyle, selectedId, customBgColor, customBgElRef.current)
+  }, [layers, bgStyle, selectedId, customBgColor, customBgUrl])
 
   useEffect(() => { redraw() }, [redraw])
+
+  const handleCustomBgPick = (e) => {
+    const f = e.target.files[0]; if (!f) return
+    const url = URL.createObjectURL(f)
+    const img = new Image()
+    img.onload = () => { customBgElRef.current = img; setCustomBgUrl(url); setBgStyle('customImage') }
+    img.src = url
+  }
 
   const getCanvasPoint = (e) => {
     const canvas = canvasRef.current
@@ -453,7 +478,7 @@ export default function ContentStudioPage({ shout }) {
         </div>
 
         <div style={{marginTop:12,display:'flex',alignItems:'center',gap:8}}>
-          <div onClick={()=>setUseSearch(v=>!v)}
+          <div onClick={()=>{setUseSearch(v=>!v); if(useSearch) setForceSearch(false)}}
             style={{width:38,height:22,borderRadius:11,cursor:'pointer',position:'relative',
                    background:useSearch?C.blue:C.slateLight,transition:'all .2s'}}>
             <div style={{position:'absolute',top:2,left:useSearch?18:2,
@@ -461,6 +486,20 @@ export default function ContentStudioPage({ shout }) {
           </div>
           <div style={{fontSize:11,color:C.slate}}>🔍 联网参考同类商品热门关键词</div>
         </div>
+
+        {useSearch && (
+          <div style={{marginTop:8,display:'flex',alignItems:'center',gap:8,paddingLeft:8}}>
+            <div onClick={()=>setForceSearch(v=>!v)}
+              style={{width:32,height:18,borderRadius:9,cursor:'pointer',position:'relative',
+                     background:forceSearch?C.red:C.slateLight,transition:'all .2s'}}>
+              <div style={{position:'absolute',top:2,left:forceSearch?16:2,
+                           width:14,height:14,borderRadius:7,background:'#fff',transition:'all .2s'}}/>
+            </div>
+            <div style={{fontSize:10,color:C.slate}}>
+              ⚡ 强制联网（会更慢；AI 仍可能自行判断，不保证 100% 触发）
+            </div>
+          </div>
+        )}
 
         <button onClick={handleGenerate} disabled={!file||loading}
           style={{...S.btn(C.orange),marginTop:12,opacity:(!file||loading)?0.6:1}}>
@@ -520,7 +559,7 @@ export default function ContentStudioPage({ shout }) {
           </div>
 
           <div style={{fontSize:11,fontWeight:700,color:C.slate,marginBottom:6}}>背景风格</div>
-          <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
+          <div style={{display:'flex',gap:8,marginBottom:8,flexWrap:'wrap',alignItems:'center'}}>
             {Object.entries(BG_STYLES).map(([id,s])=>(
               <button key={id} onClick={()=>setBgStyle(id)}
                 style={{padding:'6px 12px',borderRadius:20,border:'none',cursor:'pointer',
@@ -529,6 +568,24 @@ export default function ContentStudioPage({ shout }) {
                 {s.label}
               </button>
             ))}
+            <button onClick={()=>setBgStyle('customColor')}
+              style={{padding:'4px 12px 4px 6px',borderRadius:20,border:'none',cursor:'pointer',
+                background:bgStyle==='customColor'?C.orange:C.cream,color:bgStyle==='customColor'?'#fff':C.slate,
+                fontWeight:bgStyle==='customColor'?700:400,fontSize:11,display:'flex',alignItems:'center',gap:6}}>
+              <input type="color" value={customBgColor}
+                onClick={e=>e.stopPropagation()}
+                onChange={e=>{setCustomBgColor(e.target.value); setBgStyle('customColor')}}
+                style={{width:18,height:18,border:'none',borderRadius:4,cursor:'pointer',padding:0}}/>
+              自选颜色
+            </button>
+          </div>
+          <div style={{marginBottom:12}}>
+            <input ref={customBgFileRef} type="file" accept="image/*" style={{display:'none'}} onChange={handleCustomBgPick}/>
+            <button onClick={()=>customBgFileRef.current?.click()}
+              style={{padding:'6px 12px',borderRadius:20,border:`1px dashed ${C.slateLight}`,cursor:'pointer',
+                background:bgStyle==='customImage'?C.orange+'15':'#fff',color:C.slate,fontSize:11}}>
+              🖼 {customBgUrl?'已上传自定义背景（点击更换）':'上传自己的背景图（木纹/大理石展台等）'}
+            </button>
           </div>
 
           <div style={{fontSize:11,fontWeight:700,color:C.slate,marginBottom:6}}>文案语言</div>
